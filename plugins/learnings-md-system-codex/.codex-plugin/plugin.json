@@ -1,0 +1,21 @@
+{
+  "name": "learnings-md-system-codex",
+  "version": "0.2.10",
+  "description": "Provide Codex session-start guidance, preflight advice, and access to the shared LEARNINGS archive.",
+  "author": {
+    "name": "S DeWell"
+  },
+  "homepage": "https://github.com/sdewell/learnings-md-system",
+  "repository": "https://github.com/sdewell/learnings-md-system",
+  "keywords": ["codex", "learnings", "memory", "hooks"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "LEARNINGS for Codex",
+    "shortDescription": "Reuse the shared LEARNINGS system from Codex.",
+    "longDescription": "Load shared guidance at session start, run the preflight advisory, and use the shared learn CLI to search or add archive entries.",
+    "developerName": "S DeWell",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": "Search our shared project learnings before working in a gotcha-prone area."
+  }
+}

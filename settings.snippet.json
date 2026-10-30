@@ -1,0 +1,50 @@
+{
+  "_comment_top": "This is a REFERENCE snippet, not auto-applied. Shows the hook registrations this project owns. Merge into ~/.claude/settings.json's `hooks` block manually — your real settings file likely has additional entries (format-on-save, agent-flow, rtk-rewrite, etc.) that must be preserved.",
+  "_comment_paths": "Hook commands resolve the provider-neutral installed core from LEARNINGS_CORE_HOME, defaulting to $HOME/.local/share/learnings-md-system.",
+  "_comment_preflight": "PreToolUse/Bash hosts preflight-gate.py — the advisory pre-flight gate. Fires ONLY on `gh pr create` (one firing per review unit); emits hookSpecificOutput.additionalContext with the root-cause-class questions from the neutral core's bin/preflight-gate-classes.json. Fail-open by design: any error exits 0 silently and never blocks the command — the `|| true` in the command string extends that to a missing/undeployed hook file (python exits 2 when it can't open the script, and PreToolUse treats exit 2 as a BLOCK). CHAINS with block-git-add-sweep.sh (separate PreToolUse/Bash entries, disjoint command patterns — sweep-staging vs PR creation — so at most one speaks per command).",
+  "_comment_design": "Quiet corpus, Stage 1 (docs/superpowers/specs/2026-09-05-quiet-corpus-stage1.md): no hook writes on a timer. The PostToolUse hook (learning-hook.py), PreCompact hook (learning-on-compact.py), SessionEnd hook (learning-on-end.py), and the SessionStart mine trigger (learning-mine-trigger.py) were deleted in the 2026-09-06 trim PR — remove any registration of them from ~/.claude/settings.json if present; the files no longer exist to run. SessionStart keeps THREE hooks in load-bearing order: commit-learnings.sh, learnings-register.sh, learning-on-start.py. Commit first snapshots a settled legacy corpus before registration may change authority. Registration second enrolls only exact $HOME/Code/<category>/<repository> Git roots. Orientation third observes that result and now also fires on compact. PostToolUseFailure hosts the only nudge to write.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "UV_CACHE_DIR=\"${XDG_CACHE_HOME:-$HOME/.cache}/learnings-md-system/uv-cache\" uv run --no-project --offline --python '>=3.11' python \"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/hooks/commit-learnings.sh\" 2>> /tmp/claude-hooks-error.log"
+          },
+          {
+            "type": "command",
+            "command": "\"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/bin/learnings-register.sh\""
+          },
+          {
+            "type": "command",
+            "command": "UV_CACHE_DIR=\"${XDG_CACHE_HOME:-$HOME/.cache}/learnings-md-system/uv-cache\" uv run --no-project --offline --python '>=3.11' python \"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/hooks/learning-on-start.py\" 2>> /tmp/claude-hooks-error.log"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "UV_CACHE_DIR=\"${XDG_CACHE_HOME:-$HOME/.cache}/learnings-md-system/uv-cache\" uv run --no-project --offline --python '>=3.11' python \"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/hooks/preflight-gate.py\" 2>> /tmp/claude-hooks-error.log || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "UV_CACHE_DIR=\"${XDG_CACHE_HOME:-$HOME/.cache}/learnings-md-system/uv-cache\" uv run --no-project --offline --python '>=3.11' python \"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/hooks/learning-on-failure.py\" 2>> /tmp/claude-hooks-error.log"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+name: Public release checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-and-use:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Deploy and use an explicitly enabled project
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/learnings-home"
+          export XDG_STATE_HOME="$HOME/.local/state"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export UV_CACHE_DIR="$RUNNER_TEMP/uv-cache"
+          mkdir -p "$HOME"
+          bin/deploy.sh
+          project="$RUNNER_TEMP/learnings-example"
+          git init -q "$project"
+          git -C "$project" config core.hooksPath /dev/null
+          learn="$HOME/.local/share/learnings-md-system/bin/learn"
+          "$learn" corpus init --cwd "$project" --apply --yes
+          "$learn" add ci Patterns "public CI verification" --cwd "$project"
+          "$learn" search "public CI verification" --cwd "$project" > "$RUNNER_TEMP/search-result.txt"
+          grep -F "public CI verification" "$RUNNER_TEMP/search-result.txt"
+          test ! -e "$project/LEARNINGS.md"

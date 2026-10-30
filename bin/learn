@@ -1,0 +1,3355 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+# learnings-system CLI — shared corpus management
+# (ownership marker — required by bin/deploy.sh's no-clobber check)
+"""learnings CLI — user-facing surface for the learnings-system.
+
+Subcommands:
+  status   show file sizes, section counts, ref-counts
+  search   keyword search across project + global learnings (Phase 1.next)
+  add      append an entry to a topic file (wraps learnings-write.sh)
+  deploy      wraps bin/deploy.sh
+  corpus      per-file corpus baseline + drift (Part 7A)
+
+Run with --help for argument details.
+
+Design context: see the source repository's documentation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def _load_state_module():
+    """Load the state module from this CLI's trusted sibling directory."""
+    name = "learnings_state"
+    here = Path(__file__).resolve().parent
+    candidates = (here / "learnings-state.sh", here / "learnings" / "learnings-state.sh")
+    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if path is None:
+        raise RuntimeError("cannot load learnings-state.sh; run bin/deploy.sh")
+    cached = sys.modules.get(name)
+    if cached is not None and Path(getattr(cached, "__file__", None) or "").resolve() == path.resolve():
+        return cached
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:
+        raise RuntimeError(f"cannot load state module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+STATE = _load_state_module()
+LEARN_CORPUS_MUTATING_ACTIONS = STATE.LEARN_CORPUS_MUTATING_ACTIONS
+
+
+def _state_seam_active() -> bool:
+    """Silent runtime-mode probe (decision 4): activation_status never
+    prints; fail-open to legacy behavior when the probe errors."""
+    try:
+        return STATE.activation_status().state == STATE.ACTIVATION_VALID
+    except Exception:
+        return False
+
+
+def _installed_bin_dir() -> Path:
+    """Return the trusted helper directory for this CLI installation.
+
+    Flat installed copies keep `learn` beside their helpers. Source checkouts
+    preserve the historical installed-tree fallback, and the legacy Claude
+    tree keeps helpers below its CLI. With valid activation the neutral-core
+    bin outranks the rollback tree (finding 5: a stale pre-slice rollback
+    tree must not shadow the neutral helpers); legacy-mode preference is
+    unchanged.
+    """
+    here = Path(__file__).resolve().parent
+    home = Path(os.environ.get("HOME") or Path.home())
+    if (here / "deploy.sh").is_file():
+        configured_core = os.environ.get("LEARNINGS_CORE_HOME")
+        if configured_core and (Path(configured_core) / "bin").is_dir():
+            return Path(configured_core) / "bin"
+        core = Path(
+            os.environ.get("LEARNINGS_CORE_HOME") or home / ".local" / "share" / "learnings-md-system"
+        )
+        legacy = home / ".claude" / "bin" / "learnings"
+        if _state_seam_active() and (core / "bin").is_dir():
+            return core / "bin"
+        if legacy.is_dir():
+            return legacy
+        if (core / "bin").is_dir():
+            return core / "bin"
+        return legacy
+    if (here / "learnings-write.sh").is_file():
+        return here
+    return here / "learnings"
+
+
+GLOBAL_BIN_DIR = _installed_bin_dir()
+
+
+# Movable-state writers must be "bridged" — load their sibling
+# learnings-state.sh seam — to honor an activated neutral state root. In
+# neutral mode an unbridged project-local pin would silently write legacy
+# paths, so it falls through to the installed current copy; legacy mode and
+# non-writer scripts keep plain local-first precedence. Duplicated across
+# the five resolver copies (standalone-file convention); contract pinned by
+# tests/test_resolver_parity.py.
+_STATE_WRITER_SCRIPTS = frozenset(
+    {
+        "learnings-write.sh",
+        "learnings-retire.sh",
+        "learnings-index.sh",
+    }
+)
+_BRIDGE_SCAN_MAX_BYTES = 1 << 20
+# Functional bridge marker: every bridged state writer defines its
+# _load_state_module seam. A bare filename substring matched comments too
+# (finding 4).
+_BRIDGE_MARKER = b"def _load_state_module("
+
+
+def _local_writer_needs_bridge_fallback(local_path: Path, name: str) -> bool:
+    if name not in _STATE_WRITER_SCRIPTS:
+        return False
+    if not _state_seam_active():
+        return False
+    try:
+        with open(local_path, "rb") as fh:
+            return _BRIDGE_MARKER not in fh.read(_BRIDGE_SCAN_MAX_BYTES)
+    except OSError:
+        return True  # unreadable local pin cannot prove it is bridged
+
+
+def _resolve_helper(cwd: Path, name: str) -> Path | None:
+    """Project-local cwd/bin/{name} first, then this installation's helpers.
+
+    One of six near-identical copies — keep in sync with
+    hooks/learning-hook.py::_resolve_learnings_script,
+    hooks/learning-on-start.py::_resolve_learnings_script,
+    bin/learnings-auto-split.sh::resolve_script,
+    bin/learnings-review.sh::resolve_script, and
+    bin/learnings-reduce.sh::_resolve_helper. Contract pinned by
+    tests/test_resolver_parity.py.
+    """
+    local = cwd / "bin" / name
+    if local.is_file() and not _local_writer_needs_bridge_fallback(local, name):
+        return local
+    glb = GLOBAL_BIN_DIR / name
+    if glb.is_file():
+        return glb
+    return None
+
+
+SNIPPET_CONTEXT_LINES = 0  # 0 = matched line only; bump if we want context
+
+
+def _is_safe_learnings_file(path: Path, cwd: Path) -> bool:
+    """Reject symlinks, hardlinks, and any path that resolves outside cwd.
+
+    Codex iteration-5 finding (high, security): a malicious or
+    compromised repo can drop `LEARNINGS-secrets.md -> ~/.ssh/config`
+    or similar. The CLI then reads symlink targets via Path.read_text()
+    and prints matching lines into the agent's transcript — an
+    exfiltration vector.
+
+    Codex iteration-7 finding (high, security): hardlinks share the
+    inode but appear as regular files (`is_symlink()` returns False).
+    A LEARNINGS-X.md hardlinked to ~/.ssh/id_rsa would bypass the
+    symlink check; reading the file reads the linked inode contents.
+    Reject st_nlink > 1 to close this vector.
+
+    Rule: a LEARNINGS file must be (a) a regular file, (b) NOT a
+    symlink, (c) have st_nlink == 1 (no hardlinks), and (d) resolve
+    to inside the project cwd.
+    """
+    try:
+        if path.is_symlink():
+            return False
+        if not path.is_file():
+            return False
+        st = path.stat()
+        if st.st_nlink > 1:
+            return False
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    try:
+        resolved.relative_to(cwd.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+_REF_COUNT_FLOCK_TIMEOUT_S = 2
+
+
+def _find_header_ref_count(content: str) -> re.Match[str] | None:
+    """Match the metadata ref-count marker, but only in the file's HEAD
+    region (above any `## ` section heading). Bullets in the body that
+    document the marker syntax must NOT be treated as the metadata
+    header (Codex iter-26 Phase 2). The marker is always inserted right
+    after the H1, before any sections."""
+    return STATE.find_header_ref_count(content)
+
+
+# bin/learnings-state.sh::structural_lock_path is the source of truth for
+# this derivation — the same project-scoped lock all writers (orchestrator,
+# write helper, ref-count bumper) serialize on. Without this, the
+# atomic-replace ref-count path would orphan the inode that
+# learnings-write.sh's flock is waiting on, losing concurrent writes
+# (Codex iter-3 Phase 2).
+def _project_lock_path(cwd: Path) -> Path:
+    return STATE.structural_lock_path(cwd)
+
+
+def _try_acquire_lock_path(lock_path: Path) -> int | None:
+    """Non-blocking acquire of the project-scoped structural lock.
+
+    Returns the open fd on success (caller must release + close) or
+    None if the lock is already held (caller should skip the bump —
+    counter is approximate by design).
+    """
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _try_acquire_project_lock(cwd: Path) -> int | None:
+    return _try_acquire_lock_path(_project_lock_path(cwd))
+
+
+def _release_project_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _bump_ref_count_unsafe(path: Path, *, max_bytes: int | None = None) -> str | None:
+    """Perform one lock-held, best-effort-safe counter replacement."""
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        return
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+            return
+        if max_bytes is not None and st.st_size > max_bytes:
+            return
+        if max_bytes is None:
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                content = handle.read()
+        else:
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                raw = handle.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                return
+            content = raw.decode("utf-8")
+        new_content = _apply_ref_bump(content)
+        if new_content == content:
+            return
+        if max_bytes is not None and len(new_content.encode("utf-8")) > max_bytes:
+            return
+        _atomic_replace(path, new_content)
+        return new_content
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _bump_ref_counts(location, paths: list[Path]) -> dict[Path, str]:
+    """Best-effort one-lock ref-count batch for a resolved corpus location.
+
+    The returned post-replace content is the exact text written while the
+    location lock was held. Search uses it to recompute line numbers without an
+    unlocked reread; files whose bump was skipped retain their initial snapshot.
+    """
+    if not paths:
+        return {}
+    # A harness session reads but never records use: skip before the seam
+    # refuses (no lock attempt, no stderr).
+    if STATE.session_class() == "harness":
+        return {}
+    # Ref-counts are intentionally best effort, but they must be one coherent
+    # zero-wait batch: a failure means neither a partial count nor a retry.
+    try:
+        with STATE.corpus_write_session(location, timeout_seconds=0) as session:
+            replacements = []
+            for path in dict.fromkeys(paths):
+                snapshot = session.read(path)
+                updated = _apply_ref_bump(snapshot.text)
+                if updated != snapshot.text:
+                    replacements.append((snapshot, updated))
+            if not replacements:
+                return {}
+            result = session.commit(STATE.CorpusMutationBatch(replacements=tuple(replacements)))
+            return {path: snapshot.text for path, snapshot in result.committed.items()}
+    except Exception:
+        return {}
+
+
+def _atomic_replace(target: Path, new_content: str) -> None:
+    """Write `new_content` to a temp in target's dir, fsync, atomic-rename.
+
+    Preserves the target's mode/uid/gid before the swap (Codex iter-2
+    Phase 2 finding): mkstemp's default 0600 would otherwise silently
+    downgrade a 0644 LEARNINGS file on the first ref-count bump.
+
+    Crash-safe: at no point is the target file truncated-but-not-yet-rewritten.
+    On any error, attempt to clean up the temp file and re-raise.
+    """
+    tmp_dir = target.parent
+    # Same-dir temp so rename is on the same filesystem (atomic guarantee)
+    tmp_fd, tmp_path = _mkstemp_in_dir(tmp_dir, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tf:
+            tf.write(new_content)
+            tf.flush()
+            os.fsync(tf.fileno())
+        # Copy mode AND owner/group from original BEFORE rename
+        # (Codex iter-31 Phase 2: docstring claimed both but only
+        # chmod was called — every search bump on a group-owned /
+        # ACL-managed LEARNINGS file would silently strip the
+        # group/ACL metadata that backup/sync/security policy
+        # depends on). Best-effort — chown to the SAME (uid, gid)
+        # the user already owns succeeds without root; cross-user
+        # chown would fail silently, which is correct (we'd rather
+        # keep the new file than crash the search).
+        try:
+            st = target.stat()
+            os.chmod(tmp_path, st.st_mode & 0o7777)
+            try:
+                os.chown(tmp_path, st.st_uid, st.st_gid)
+            except OSError:
+                pass
+        except OSError:
+            pass
+        os.replace(tmp_path, str(target))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _mkstemp_in_dir(dir_: Path, prefix: str, suffix: str) -> tuple[int, str]:
+    import tempfile
+
+    return tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=str(dir_))
+
+
+def _ref_count_deadline() -> float:
+    import time
+
+    return time.time() + _REF_COUNT_FLOCK_TIMEOUT_S
+
+
+def _try_acquire_flock(f, deadline: float) -> None:
+    import time
+
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.time() >= deadline:
+                raise TimeoutError("ref-count flock timeout") from None
+            time.sleep(0.02)
+
+
+def _apply_ref_bump(content: str) -> str:
+    """Return content with the ref-count line incremented (or inserted)."""
+    now = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%MZ")
+    m = _find_header_ref_count(content)
+    if m:
+        new_count = int(m.group("count")) + 1
+        new_line = f"<!-- ref-count: {new_count}, last-ref: {now} -->"
+        return content[: m.start()] + new_line + content[m.end() :]
+    # Insert: right after H1 line if present, else at top.
+    new_line = f"<!-- ref-count: 1, last-ref: {now} -->"
+    lines = content.splitlines(keepends=True)
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            insert_at = i + 1
+            break
+    # Keep one blank line between H1 and the marker for readability
+    prefix = "\n" if insert_at > 0 and not (
+        len(lines) > insert_at and lines[insert_at].strip() == ""
+    ) else ""
+    suffix = "\n"
+    new_lines = (
+        lines[:insert_at] + [prefix + new_line + suffix] + lines[insert_at:]
+    )
+    return "".join(new_lines)
+
+
+def _read_ref_count(path: Path) -> int | None:
+    """Return the ref-count if present in the file, else None.
+
+    Codex iter-32 (Phase 2): use _safe_read_text — fd-bound safety
+    closes the same TOCTOU window iter-23 closed for search. Without
+    it, status's read of vetted paths (after _learnings_files filter)
+    could be racing a swapped symlink/hardlink/FIFO and inspect the
+    target's contents.
+    """
+    body = _safe_read_text(path)
+    if body is None:
+        return None
+    head = body[:1024]
+    # Codex iter-26 (Phase 2): use the HEAD-aware finder so a bullet
+    # documenting the marker syntax doesn't get reported as the count.
+    m = _find_header_ref_count(head)
+    if m is None:
+        return None
+    try:
+        return int(m.group("count"))
+    except ValueError:
+        return None
+
+
+def _learnings_files(cwd: Path) -> list[Path]:
+    """Return all SAFE LEARNINGS files in cwd (monolith + topic subfiles).
+
+    Symlinks and out-of-cwd paths are rejected — see _is_safe_learnings_file.
+    Subfiles sorted alphabetically for deterministic output.
+    """
+    files: list[Path] = []
+    main = cwd / "LEARNINGS.md"
+    if main.exists() and _is_safe_learnings_file(main, cwd):
+        files.append(main)
+    for sub in sorted(cwd.glob("LEARNINGS-*.md")):
+        if _is_safe_learnings_file(sub, cwd):
+            files.append(sub)
+    return files
+
+
+_EXTERNAL_CORPUS_ERROR_PREFIX = "learn: external corpus unavailable: "
+_PROJECT_CORPUS_ERROR_PREFIX = "learn: project corpus unavailable: "
+_GLOBAL_CORPUS_ERROR_PREFIX = "learn: global corpus unavailable: "
+_EXTERNAL_CORPUS_ERROR_MAX_BYTES = 512
+
+
+class _CorpusConsumerError(RuntimeError):
+    pass
+
+
+def _render_corpus_error(exc: BaseException, prefix: str) -> None:
+    message = " ".join(str(exc).split())
+    budget = _EXTERNAL_CORPUS_ERROR_MAX_BYTES - len(prefix.encode("utf-8")) - 1
+    payload = message.encode("utf-8", errors="replace")[:budget]
+    print(prefix + payload.decode("utf-8", errors="ignore"), file=sys.stderr)
+
+
+def _render_external_corpus_error(exc: BaseException) -> None:
+    _render_corpus_error(exc, _EXTERNAL_CORPUS_ERROR_PREFIX)
+
+
+def _resolve_consumer_cwd(raw: str | None) -> Path:
+    try:
+        return Path(raw or ".").resolve()
+    except OSError as exc:
+        _render_corpus_error(exc, _PROJECT_CORPUS_ERROR_PREFIX)
+        raise _CorpusConsumerError from exc
+
+
+def _strict_corpus_location(cwd: Path):
+    """Resolve once; strict authority defects get one CLI-owned diagnostic."""
+    try:
+        metadata = cwd.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        _render_corpus_error(exc, _PROJECT_CORPUS_ERROR_PREFIX)
+        raise _CorpusConsumerError from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        return None
+    try:
+        return STATE.resolve_project_corpus_strict(cwd)
+    except STATE.ProjectRootError as exc:
+        _render_corpus_error(exc, _PROJECT_CORPUS_ERROR_PREFIX)
+        raise _CorpusConsumerError from exc
+    except STATE.IdentityResolutionError as exc:
+        _render_corpus_error(exc, _PROJECT_CORPUS_ERROR_PREFIX)
+        raise _CorpusConsumerError from exc
+    except (STATE.CorpusResolutionError, ValueError) as exc:
+        _render_external_corpus_error(exc)
+        raise _CorpusConsumerError from exc
+
+
+def _legacy_consumer_location(cwd: Path):
+    """Compatibility location for an uncatalogued legacy checkout."""
+    return STATE.CorpusLocation(
+        cwd, "", cwd, STATE.structural_lock_path(cwd), "legacy-repository"
+    )
+
+
+def _location_snapshots(location):
+    """Select and read a resolved corpus through the state-owned policy."""
+    try:
+        return tuple(
+            STATE.read_external_corpus_snapshot(location, path)
+            for path in STATE.select_external_corpus_files(location)
+        )
+    except STATE.CorpusResolutionError as exc:
+        _render_external_corpus_error(exc)
+        return None
+
+
+def _read_ref_count_text(body: str) -> int | None:
+    m = _find_header_ref_count(body[:1024])
+    if m is None:
+        return None
+    try:
+        return int(m.group("count"))
+    except ValueError:
+        return None
+
+
+def _search_text(body: str, query: str) -> list[tuple[int, str]]:
+    # Split on "\n" only, NOT splitlines(): splitlines() would treat a
+    # \r-terminated line in a CRLF file as its own line, shifting line
+    # numbers relative to every other line-oriented reader of this file.
+    needle = query.lower()
+    return [
+        (line_number, line)
+        for line_number, line in enumerate(body.split("\n"), start=1)
+        if needle in line.lower()
+    ]
+
+
+def _relocate_initial_hits(
+    original_hits: list[tuple[int, str]], post_bump: str
+) -> list[tuple[int, str]]:
+    """Keep initial membership/text; relocate unchanged lines after a bump."""
+    positions: dict[str, list[int]] = {}
+    for line_number, line in enumerate(post_bump.split("\n"), start=1):
+        positions.setdefault(line, []).append(line_number)
+    occurrences: dict[str, int] = {}
+    relocated: list[tuple[int, str]] = []
+    for original_line, text in original_hits:
+        occurrence = occurrences.get(text, 0)
+        candidates = positions.get(text, ())
+        line_number = candidates[occurrence] if occurrence < len(candidates) else original_line
+        occurrences[text] = occurrence + 1
+        relocated.append((line_number, text))
+    return relocated
+
+
+# --- Phase 3: global pool plumbing --------------------------------
+
+
+def _default_pool_dir() -> Path:
+    return STATE.state_paths().child("portable")
+
+
+# Codex Phase 3 round-2 [high]: pool symlink target validation. Without
+# these, a tampered symlink at ~/.claude/learnings/portable/foo-PORTABLE-LEARNINGS.md
+# can point at any absolute file (private notes, /etc/passwd, multi-MB
+# log) and `learn search --scope global` would read+grep it. The pool
+# dir is user-writable; treat its CONTENTS as user-controlled but
+# verify INVARIANTS that legitimate distill-written symlinks always
+# satisfy.
+_POOL_PORTABLE_SUFFIX = "-PORTABLE-LEARNINGS.md"
+_POOL_MAX_BYTES = 1 << 20  # 1 MiB cap; portable files top out at ~30 KB
+# Codex Phase 3 round-21 [high]: pool ownership proof. Distill writes
+# every portable with `<!-- distilled-from: <hash> -->`; absence of
+# the marker means the pool target is foreign (user-writable pool
+# dir + tampered/legitimate non-distill file). Pool entries without
+# the marker get filtered OUT of search results so global pool can't
+# be poisoned via an unmarked basename-matching file.
+_POOL_DISTILLED_FROM_RE = re.compile(
+    r"<!--\s*distilled-from:\s*[0-9a-f]+\s*-->", re.IGNORECASE
+)
+
+
+def _identity_pool_files(state_root: Path) -> list[Path]:
+    """Neutral-mode pool: each catalog project's identity-owned portable.md
+    that passes the same content validation as the legacy symlink pool —
+    regular non-hardlinked file under the size cap with a distilled-from
+    ownership marker. A project without a portable is silently absent; one
+    corrupt identity record costs one stderr line and one record, never the
+    whole pool (finding 7)."""
+    out: list[Path] = []
+    records = STATE.iter_project_records(
+        state_root,
+        on_invalid=lambda entry, err: print(
+            f"learn: skipping corrupt catalog record {entry.name}: {err}", file=sys.stderr
+        ),
+    )
+    for key, _record in records:
+        portable = Path(state_root) / "projects" / key / "portable.md"
+        try:
+            tst = portable.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(tst.st_mode) or tst.st_nlink > 1 or tst.st_size > _POOL_MAX_BYTES:
+            continue
+        text = _safe_read_text(portable, max_bytes=_POOL_MAX_BYTES)
+        if text is None or not _POOL_DISTILLED_FROM_RE.search(text):
+            continue
+        out.append(portable)
+    return out
+
+
+def _pool_files(pool_dir: Path | None = None) -> list[Path]:
+    """Return resolved targets of every `*-PORTABLE-LEARNINGS.md` symlink
+    in the central pool. Skips entries that fail tamper checks.
+
+    Validations (Codex Phase 3 round-2 [high]):
+      1. Entry is a symlink with an absolute target.
+      2. Target exists on disk (not dangling).
+      3. Target basename equals the symlink basename
+         (_ensure_pool_symlink always names the symlink `target.name`,
+         so a mismatch indicates tampering — refuse to follow).
+      4. Target basename ends with `-PORTABLE-LEARNINGS.md` (defense
+         in depth — invariant 3 + glob already imply this, but explicit
+         check survives a future change to the glob pattern).
+      5. Target is a regular file (not a directory, FIFO, etc.) and
+         not hardlinked to anything outside.
+      6. Target is at most `_POOL_MAX_BYTES`.
+
+    Sorted by basename for deterministic output.
+
+    Neutral mode (decision 8's search half): with activation valid and no
+    explicit pool_dir, the identity-owned catalog IS the pool — every
+    `projects/<key>/portable.md` passing the same content validation.
+    """
+    if pool_dir is None:
+        paths = STATE.state_paths()
+        if paths.active:
+            return _identity_pool_files(paths.root)
+        pool_dir = _default_pool_dir()
+    pool_dir = Path(pool_dir)
+    if not pool_dir.is_dir():
+        return []
+    out: list[Path] = []
+    for entry in sorted(pool_dir.glob("*-PORTABLE-LEARNINGS.md")):
+        try:
+            target_str = os.readlink(str(entry))
+        except OSError:
+            # Either not a symlink or unreadable — skip. (We only
+            # consume symlink-form pool entries in v1.)
+            continue
+        target = Path(target_str)
+        if not target.is_absolute():
+            # _ensure_pool_symlink only writes absolute targets; a
+            # relative one is suspicious — skip.
+            continue
+        # Invariant: legitimate symlink basename == target basename
+        if target.name != entry.name:
+            continue
+        # Invariant: portable filename suffix
+        if not target.name.endswith(_POOL_PORTABLE_SUFFIX):
+            continue
+        # Use lstat to avoid following any further symlink chain on
+        # the target side; we only follow the FIRST symlink (the pool
+        # entry) and require its target to be a real file.
+        try:
+            tst = target.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(tst.st_mode):
+            continue  # dir, FIFO, second-hop symlink, device
+        if tst.st_nlink > 1:
+            continue  # hardlinked outside its directory — refuse
+        if tst.st_size > _POOL_MAX_BYTES:
+            continue  # blow-up protection
+        # Codex Phase 3 round-21 [high]: ownership proof. Pool entries
+        # without a `distilled-from` marker are foreign content that
+        # happens to live at a matching name. Surfacing them as
+        # trusted global learning would let anyone with write access
+        # to the pool dir poison `learn search --scope global`. Read
+        # via fd-bound safe-read with the pool size cap; require the
+        # marker.
+        target_text = _safe_read_text(target, max_bytes=_POOL_MAX_BYTES)
+        if target_text is None:
+            continue
+        if not _POOL_DISTILLED_FROM_RE.search(target_text):
+            continue
+        # Codex Phase 3 round-6 [high]: do NOT call .resolve() here.
+        # Resolve is a second path traversal after lstat-validation —
+        # if the target gets swapped to a symlink in the window
+        # between, resolve() follows it and the eventual read opens
+        # an unintended file (O_NOFOLLOW only protects the leaf).
+        # Return the raw target; _safe_read_text(O_NOFOLLOW) provides
+        # the leaf-level swap defense via its own fd-bound recheck.
+        out.append(target)
+    return out
+
+
+# F2 v1: tag parsing for `learn metrics`. Tag format from
+# learnings-write.sh: `<!-- @<session-id> <YYYY-MM-DDTHH:MMZ> -->`.
+# Tolerant: returns the raw timestamp string on success, None otherwise.
+_SESSION_TAG_PARSE_RE = re.compile(
+    r"<!--\s*(?:id:[0-9a-z]{6}\s+)?@\S+\s+"
+    r"(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}Z\s*-->"
+)
+
+
+def _parse_session_tag_date(line: str) -> str | None:
+    m = _SESSION_TAG_PARSE_RE.search(line)
+    return m.group(1) if m else None
+
+
+def _collect_file_metrics(path: Path) -> dict | None:
+    """Return per-file metrics dict (or None if unreadable). Pure read."""
+    body = _safe_read_text(path)
+    if body is None:
+        return None
+    entry_count = 0
+    section_count = 0
+    tagged_dates: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("## "):
+            section_count += 1
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            entry_count += 1
+            d = _parse_session_tag_date(stripped)
+            if d is not None:
+                tagged_dates.append(d)
+    ref = _read_ref_count(path)
+    tagged_dates.sort()
+    return {
+        "name": path.name,
+        "size_bytes": len(body.encode("utf-8")),
+        "entries": entry_count,
+        "sections": section_count,
+        "ref_count": ref,
+        "tagged_count": len(tagged_dates),
+        "oldest_date": tagged_dates[0] if tagged_dates else None,
+        "newest_date": tagged_dates[-1] if tagged_dates else None,
+    }
+
+
+def _collect_snapshot_metrics(snapshot) -> dict:
+    body = snapshot.text
+    entry_count = 0
+    section_count = 0
+    tagged_dates: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("## "):
+            section_count += 1
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            entry_count += 1
+            date = _parse_session_tag_date(stripped)
+            if date is not None:
+                tagged_dates.append(date)
+    tagged_dates.sort()
+    return {
+        "name": snapshot.name,
+        "size_bytes": snapshot.size_bytes,
+        "entries": entry_count,
+        "sections": section_count,
+        "ref_count": _read_ref_count_text(body),
+        "tagged_count": len(tagged_dates),
+        "oldest_date": tagged_dates[0] if tagged_dates else None,
+        "newest_date": tagged_dates[-1] if tagged_dates else None,
+    }
+
+
+def _safe_read_text(path: Path, max_bytes: int | None = None) -> str | None:
+    """Read `path` with the standard fd-bound safety policy
+    (O_NOFOLLOW + S_ISREG + nlink==1, all checked on the same fd).
+
+    Returns None on any unsafe condition or read error. Closes the
+    TOCTOU window between the upstream `_is_safe_learnings_file`
+    preflight and the actual read by re-validating on the SAME fd
+    we read from. Without this, a workspace that swaps a regular
+    file for a symlink/hardlink/FIFO between preflight and read
+    would leak the target's contents into search output.
+
+    Codex Phase 3 round-4 [high]: `max_bytes` parameter binds the
+    size cap to the SAME fd we read from. Pool readers (`_pool_files`
+    preflight, `cmd_search` for `--scope global|all`) MUST pass
+    `_POOL_MAX_BYTES` — without an fd-bound cap, a target validated
+    as small at preflight could grow before the read and bypass the
+    pool's size invariant.
+    """
+    try:
+        fd = os.open(
+            str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+    except OSError:
+        return None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_nlink > 1:
+            return None
+        if max_bytes is not None and st.st_size > max_bytes:
+            return None
+        try:
+            if max_bytes is not None:
+                # Codex Phase 3 round-14 [medium]: enforce the cap in
+                # BYTES, not characters. Text-mode `f.read(N)` returns
+                # N chars, which can be up to 4N bytes for UTF-8
+                # multibyte content. If the file grew between fstat
+                # and read, multibyte content could slip past a
+                # char-based check. Read binary, length-check bytes,
+                # decode after.
+                with os.fdopen(fd, "rb") as f:
+                    fd = -1
+                    raw_bytes = f.read(max_bytes + 1)
+                    if len(raw_bytes) > max_bytes:
+                        return None
+                    return raw_bytes.decode("utf-8")
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                fd = -1
+                return f.read()
+        except (OSError, UnicodeDecodeError):
+            return None
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def _search_file(
+    path: Path, query: str, max_bytes: int | None = None
+) -> list[tuple[int, str]]:
+    """Return [(line_number, line_text)] for case-insensitive matches.
+
+    `max_bytes` is forwarded to `_safe_read_text`. Pool callers MUST
+    pass `_POOL_MAX_BYTES` so a post-validation grow / swap can't
+    bypass the pool's size invariant (Codex Phase 3 round-4 [high]).
+    """
+    needle = query.lower()
+    hits: list[tuple[int, str]] = []
+    body = _safe_read_text(path, max_bytes=max_bytes)
+    if body is None:
+        return hits
+    for i, line in enumerate(body.splitlines(), start=1):
+        if needle in line.lower():
+            hits.append((i, line))
+    return hits
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    scope = getattr(args, "scope", "project")
+
+    location = None
+    project_snapshots = ()
+    legacy_project_files: list[Path] = []
+    pool_files: list[Path] = []
+    project_unavailable = False
+    pool_unavailable = False
+    if scope in ("project", "all"):
+        try:
+            cwd = _resolve_consumer_cwd(args.cwd)
+            location = _strict_corpus_location(cwd)
+        except _CorpusConsumerError:
+            if scope == "project":
+                return 1
+            project_unavailable = True
+        else:
+            if location is None:
+                location = _legacy_consumer_location(cwd)
+            if location.mode == "legacy-repository":
+                legacy_project_files = _learnings_files(cwd)
+            else:
+                selected = _location_snapshots(location)
+                if selected is None:
+                    if scope == "project":
+                        return 1
+                    project_unavailable = True
+                else:
+                    project_snapshots = selected
+    if scope in ("global", "all"):
+        try:
+            pool_files = _pool_files()
+        except (OSError, STATE.IdentityResolutionError) as exc:
+            _render_corpus_error(exc, _GLOBAL_CORPUS_ERROR_PREFIX)
+            if scope == "global":
+                return 1
+            pool_unavailable = True
+
+    partial = project_unavailable or pool_unavailable
+    if project_unavailable and pool_unavailable:
+        print("Search unavailable: project corpus and global corpus unavailable.")
+        return 1
+    if partial:
+        unavailable = " and ".join(
+            name
+            for name, is_unavailable in (
+                ("project corpus", project_unavailable),
+                ("global corpus", pool_unavailable),
+            )
+            if is_unavailable
+        )
+        print(f"Partial search: {unavailable} unavailable; searched available scope only.")
+
+    # One search run against the project = one count, hits or not, and
+    # before the empty-scope return below: a project with no LEARNINGS yet
+    # still answers `learn stats`. The per-file ref-count bump further down
+    # records WHICH files answered; this records THAT a search happened.
+    if scope in ("project", "all") and not project_unavailable:
+        _increment_search_count(cwd)
+
+    if not project_snapshots and not legacy_project_files and not pool_files:
+        # No LEARNINGS in scope at all — friendly empty result.
+        qualifier = "available" if partial else "current"
+        print(f"No learnings files found in {qualifier} scope.")
+        return 1 if partial else 0
+
+    # Codex Phase 3 round-4 [high]: pool reads use the fd-bound size
+    # cap so a post-_pool_files-validation grow can't bypass the pool
+    # invariant. Project-local files keep the legacy uncapped read
+    # (project owner is the user; cap is a pool-trust-boundary measure).
+    # Codex Phase 3 round-6 [high]: identify pool entries by direct
+    # string membership instead of comparing .resolve() outputs —
+    # resolve() is itself a TOCTOU traversal we just removed from
+    # _pool_files. Path equality is string-based, and `f` here IS one
+    # of the original objects in pool_files.
+    pool_paths = set(pool_files)
+    project_paths = {snapshot.path for snapshot in project_snapshots} | set(legacy_project_files)
+    results: list[tuple[Path, str, list[tuple[int, str]], bool]] = []
+    for snapshot in project_snapshots:
+        hits = _search_text(snapshot.text, args.query)
+        if hits:
+            results.append((snapshot.path, snapshot.name, hits, True))
+    for path in legacy_project_files:
+        hits = _search_file(path, args.query)
+        if hits:
+            results.append((path, path.name, hits, True))
+    for path in pool_files:
+        hits = _search_file(path, args.query, max_bytes=_POOL_MAX_BYTES)
+        if hits:
+            results.append((path, path.name, hits, False))
+
+    if not results:
+        qualifier = " in available scope" if partial else ""
+        print(f"No matches for {args.query!r}{qualifier}.")
+        return 1 if partial else 0
+
+    # Phase 3: only bump ref-counts on PROJECT-LOCAL files. Global pool
+    # entries are read-only mirrors (symlinks to other projects'
+    # source-of-truth); silently mutating someone else's file via the
+    # symlink would surprise the user. The ref-count is also a project-
+    # specific signal (validate-pass uses it locally) — pool files
+    # don't participate in that workflow.
+    bumped_content = (
+        _bump_ref_counts(location, [path for path, _name, _hits, is_project in results if is_project])
+        if location is not None and not project_unavailable
+        else {}
+    )
+
+    # Recompute project line numbers only from content written while the lock
+    # was held. An unbumped project file and every read-only pool file retain
+    # their initial verified hits; neither needs an unlocked second read.
+    rescanned: list[tuple[Path, str, list[tuple[int, str]], bool]] = []
+    for path, name, original_hits, is_project in results:
+        if is_project:
+            post_bump = bumped_content.get(path)
+            if post_bump is not None:
+                new_hits = _relocate_initial_hits(original_hits, post_bump)
+            else:
+                new_hits = original_hits
+        else:
+            new_hits = original_hits
+        rescanned.append((path, name, new_hits, is_project))
+
+    def _result_label(item: tuple[Path, str, list[tuple[int, str]], bool]) -> str:
+        # Finding 12: every neutral pool file is named portable.md, so the
+        # bare filename collapses all attribution — label those hits with the
+        # catalog project key (the parent directory). Legacy output
+        # (slug-named symlinks, project-local files) stays byte-identical.
+        path, name, _hits, is_project = item
+        if not is_project and path in pool_paths and name == "portable.md":
+            return path.parent.name
+        return name
+
+    # Rank by descending match count; secondary sort by label for stability
+    # (identical to filename everywhere except neutral pool hits).
+    rescanned.sort(key=lambda item: (-len(item[2]), _result_label(item)))
+
+    for path, _name, hits, is_project in rescanned:
+        scope_tag = ""
+        if scope == "all":
+            # Codex Phase 3 round-7 [high]: direct membership, NOT
+            # f.resolve(). Same TOCTOU class as round-6 — resolve()
+            # after a safe-read can crash (loop) or follow an unintended
+            # path. The membership sets were built at scope-selection
+            # time; classify by the original Path object.
+            scope_tag = "  [project]" if is_project and path in project_paths else "  [global]"
+        item = (path, _name, hits, is_project)
+        print(f"{_result_label(item)} ({len(hits)} match{'es' if len(hits) != 1 else ''}){scope_tag}")
+        for lineno, text in hits:
+            print(f"  L{lineno}: {text}")
+        print()
+
+    return 1 if partial else 0
+
+
+_WRITE_MODULE_CACHE: dict[str, object] = {}
+
+
+def _load_write_module(cwd: Path):
+    """Load bin/learnings-write.sh as a module. Returns (module, error).
+
+    The writer is the canonical home of the entry-id schema (mint /
+    collect / stamp) — migrate-ids and the pruner import those helpers
+    rather than re-spelling them, for the same reason prune imports the
+    validator's definitions: two spellings of "what is an entry id" is how
+    stamp time and delete time come to disagree.
+
+    Resolved with _resolve_helper because the legacy Claude deployment keeps
+    helpers one level below this CLI while the neutral installed core keeps
+    them beside it.
+    """
+    script = _resolve_helper(cwd, "learnings-write.sh")
+    if script is None:
+        return None, (
+            f"learnings-write.sh is not present in {cwd / 'bin'} "
+            f"or {GLOBAL_BIN_DIR}; run bin/deploy.sh and retry"
+        )
+    cached = _WRITE_MODULE_CACHE.get(str(script))
+    if cached is not None:
+        return cached, ""
+    try:
+        import importlib.util as _ilu
+        from importlib.machinery import SourceFileLoader as _SFL
+
+        loader = _SFL("_learnings_write_for_ids", str(script))
+        spec = _ilu.spec_from_loader(loader.name, loader)
+        if spec is None:
+            return None, f"{script} yielded no import spec"
+        mod = _ilu.module_from_spec(spec)
+        loader.exec_module(mod)
+    except Exception as exc:
+        return None, (
+            f"{script} is present but could not be imported ({exc!r}); "
+            "re-deploying will not fix a broken helper — repair or "
+            "restore that file"
+        )
+    for attr in (
+        "mint_entry_id",
+        "collect_entry_ids",
+        "stamp_entry_ids",
+        "_is_index_mode",
+        "collect_entry_ids_from_texts",
+    ):
+        if not hasattr(mod, attr):
+            return None, (
+                f"{script} defines no {attr} — that copy predates the "
+                "entry-id schema; run bin/deploy.sh and retry"
+            )
+    _WRITE_MODULE_CACHE[str(script)] = mod
+    return mod, ""
+
+
+def cmd_migrate_ids(args: argparse.Namespace) -> int:
+    """Backfill entry ids across the project's corpus (mechanical, no LLM).
+
+    Idempotent: lines already carrying an id are untouched, so re-running
+    is free. Legacy unreadable files are warned about and skipped; an active
+    external corpus instead validates every selected file and fails closed
+    before any mutation.
+    """
+    cwd = Path(args.cwd or ".").resolve()
+    mod, err = _load_write_module(cwd)
+    if mod is None:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    try:
+        location = STATE.resolve_corpus_for_write(cwd)
+        session = STATE.corpus_write_session(location, timeout_seconds=0)
+        session.__enter__()
+    except STATE.CorpusLockTimeoutError:
+        print(
+            "error: another learnings process holds the project lock; "
+            "retry in a moment",
+            file=sys.stderr,
+        )
+        return 2
+    except (
+        STATE.ProjectRootError,
+        STATE.IdentityResolutionError,
+        STATE.CorpusResolutionError,
+        STATE.CorpusMutationError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        # File list and index-mode decision under the lock: a concurrent
+        # split can flip LEARNINGS.md into an index (or mint subfiles)
+        # mid-run, and stamping from a stale snapshot would tag the new
+        # index's link rows or miss the new subfiles.
+        files = list(session.select_files())
+        snapshots = {}
+        if location.mode == "external":
+            snapshots = {path: session.read(path) for path in files}
+        if mod._is_index_mode(location.corpus_root):
+            # A recognized index's `- topic → file` link rows are
+            # structure, not lessons; stamping them would feed them to
+            # the prune judge as entries.
+            files = [f for f in files if f.name != "LEARNINGS.md"]
+        if not files:
+            print(f"no LEARNINGS files found in {cwd}")
+            return 0
+        # One id namespace for the whole corpus: collect across every file
+        # first so a mint for file B cannot collide with an id in file A.
+        existing = (
+            mod.collect_entry_ids_from_texts(snapshot.text for snapshot in snapshots.values())
+            if location.mode == "external"
+            else mod.collect_entry_ids(location.corpus_root)
+        )
+        total = 0
+        changed = 0
+        replacements = []
+        for path in files:
+            try:
+                snapshot = snapshots.get(path) or session.read(path)
+            except (STATE.CorpusMutationError, STATE.CorpusResolutionError) as exc:
+                if location.mode == "external":
+                    raise
+                print(
+                    f"warning: skipping unreadable {path.name}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            new_text, n = mod.stamp_entry_ids(snapshot.text, existing)
+            if n:
+                replacements.append((snapshot, new_text))
+                changed += 1
+                total += n
+        if replacements:
+            session.commit(STATE.CorpusMutationBatch(replacements=tuple(replacements)))
+        print(f"{total} entries stamped across {changed} file(s)")
+    except (STATE.CorpusMutationError, STATE.CorpusResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        session.close()
+    return 0
+
+
+def _default_transcript_dir(cwd: Path | None = None) -> Path | None:
+    """The Claude Code transcript dir for the given project, derived from cwd.
+
+    Falls back to the process cwd when none supplied. Returns None when
+    no transcript dir exists for the project.
+
+    The runtime puts transcripts at:
+      ~/.claude/projects/<sanitized-project-path>/{session}.jsonl
+    The dir name is the cwd path with every non-alphanumeric character
+    replaced by `-` (not just `/`: learningsMD_system -> learningsMD-system,
+    an absolute home path becomes one filesystem-safe directory name).
+    """
+    project = (cwd or Path.cwd()).resolve()
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(project))
+    candidate = Path.home() / ".claude" / "projects" / sanitized
+    return candidate if candidate.is_dir() else None
+
+
+_SEARCH_COUNT_FILE = "searches.json"
+
+
+def _project_marker_dir(cwd: Path) -> Path:
+    """`~/.claude/projects/<sanitized cwd>/`, the directory
+    `_default_transcript_dir` reads and `learning-on-failure.py` writes
+    `repeats.json` to — same sanitize, same literal-cwd keying, no git
+    toplevel walk. Not required to exist; the writer creates it."""
+    sanitized = re.sub(r"[^A-Za-z0-9]", "-", str(cwd.resolve()))
+    return Path.home() / ".claude" / "projects" / sanitized
+
+
+def _increment_search_count(cwd: Path) -> None:
+    """Count one `learn search` run against the project in `searches.json`,
+    beside `repeats.json`. The index file's ref-count used to stand in for
+    this number, but a search that matches only topic subfiles never
+    touches the index, so `learn stats` under-reported (Codex found
+    `searches: 0` after a successful topic search, 2026-10-22). Best
+    effort: temp-file-then-rename (the temp is removed on failure, as
+    `_increment_repeat` in the failure hook does), a malformed file — bad
+    bytes, bad JSON, or a non-integer where the count belongs — restarts at
+    1, and no error here can fail the search. `UnicodeDecodeError` and
+    `JSONDecodeError` are ValueErrors, not OSErrors; `bool` is an `int`
+    subclass, so the shape check is `type(...) is int`."""
+    marker_dir = _project_marker_dir(cwd)
+    path = marker_dir / _SEARCH_COUNT_FILE
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        current = data.get("searches") if isinstance(data, dict) else None
+        count = (current + 1) if type(current) is int and current >= 0 else 1
+        tmp.write_text(json.dumps({"searches": count}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _read_search_count(transcript_dir: Path | None) -> int:
+    """The `searches.json` counter, or 0 when the file is absent, unreadable,
+    or malformed (bad bytes, bad JSON, non-integer) — a measurement aid,
+    never an authority record."""
+    if transcript_dir is None:
+        return 0
+    try:
+        data = json.loads((transcript_dir / _SEARCH_COUNT_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    count = data.get("searches") if isinstance(data, dict) else None
+    return count if type(count) is int and count >= 0 else 0
+
+
+def cmd_deploy(args: argparse.Namespace) -> int:
+    """Run bin/deploy.sh from the canonical-source repo.
+
+    Locates deploy.sh by walking up from this CLI file's location: the
+    CLI lives at <repo>/bin/learn or at ~/.claude/bin/learn. In the
+    deployed-copy case there's no bin/deploy.sh next to it, so we error
+    out with guidance instead of silently doing nothing.
+    """
+    script_dir = Path(__file__).resolve().parent
+    deploy = script_dir / "deploy.sh"
+    if not deploy.is_file():
+        sys.stderr.write(
+            f"error: bin/deploy.sh not found next to this CLI ({script_dir}).\n"
+            "deploy is only available when running from the canonical-source repo.\n"
+        )
+        return 1
+    proc = subprocess.run([str(deploy)])
+    return proc.returncode
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    observed_cwd = Path(args.cwd or ".").resolve()
+    write_script = _resolve_helper(observed_cwd, "learnings-write.sh")
+    if write_script is None:
+        sys.stderr.write(
+            "error: learnings-write.sh not found "
+            f"(checked {observed_cwd / 'bin'} and {GLOBAL_BIN_DIR})\n"
+        )
+        return 1
+    if args.cwd is None:
+        write_module, error = _load_write_module(observed_cwd)
+        if write_module is None:
+            sys.stderr.write(f"error: {error}\n")
+            return 1
+        cwd = write_module._resolve_learnings_dir(observed_cwd)
+    else:
+        cwd = observed_cwd
+
+    env = os.environ.copy()
+    env.setdefault("LEARNINGS_SESSION_ID", "manual")
+    command = [str(write_script), "--cwd", str(cwd), args.topic, args.section, args.entry]
+    proc = subprocess.run(
+        command,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    try:
+        cwd = _resolve_consumer_cwd(args.cwd)
+        location = _strict_corpus_location(cwd)
+    except _CorpusConsumerError:
+        return 1
+    if location is None:
+        location = _legacy_consumer_location(cwd)
+    if location.mode == "legacy-repository":
+        files = _learnings_files(location.corpus_root)
+        if not files:
+            print(f"No learnings found in {cwd}")
+            return 0
+
+        def legacy_fmt(path: Path, indent: str) -> str:
+            body = _safe_read_text(path)
+            if body is None:
+                return f"{indent}{path.name}: <unreadable / unsafe>"
+            lines = body.count("\n")
+            sections = sum(1 for line in body.splitlines() if line.startswith("## "))
+            ref = _read_ref_count(path)
+            ref_part = f", {ref} ref{'s' if ref != 1 else ''}" if ref is not None else ""
+            return f"{indent}{path.name}: {lines} lines, {sections} sections{ref_part}"
+
+        for path in (path for path in files if path.name == "LEARNINGS.md"):
+            print(legacy_fmt(path, ""))
+        for path in (path for path in files if path.name != "LEARNINGS.md"):
+            print(legacy_fmt(path, "  "))
+        return 0
+    snapshots = _location_snapshots(location)
+    if snapshots is None:
+        return 1
+
+    if not snapshots:
+        print(f"No learnings found in {cwd}")
+        return 0
+
+    # Distinguish main from subfiles for friendlier output
+    main_files = [snapshot for snapshot in snapshots if snapshot.name == "LEARNINGS.md"]
+    subfiles = [snapshot for snapshot in snapshots if snapshot.name != "LEARNINGS.md"]
+
+    def _fmt(snapshot, indent: str) -> str:
+        lines = snapshot.text.count("\n")
+        sections = sum(1 for line in snapshot.text.splitlines() if line.startswith("## "))
+        ref = _read_ref_count_text(snapshot.text)
+        ref_part = f", {ref} ref{'s' if ref != 1 else ''}" if ref is not None else ""
+        return f"{indent}{snapshot.name}: {lines} lines, {sections} sections{ref_part}"
+
+    for f in main_files:
+        print(_fmt(f, ""))
+    for sub in subfiles:
+        print(_fmt(sub, "  "))
+
+    return 0
+
+
+def _render_import_plan(plan, read_only: bool = True) -> str:
+    """Thin display of the state module's ImportPlan — presentation only;
+    the plan itself comes from the direct module API (no subprocess, no
+    second state CLI). read_only=False (apply) omits the nothing-was-
+    written trailer, which would contradict the activation report."""
+    lines = [
+        f"source: {plan.source_root}",
+        f"inventory digest: {plan.inventory_digest}",
+        f"plan generation id: {plan.generation_id or '(none - blocked or source changed)'}",
+    ]
+    counts: dict[str, int] = {}
+    for artifact in plan.artifacts:
+        counts[artifact.action] = counts.get(artifact.action, 0) + 1
+    if counts:
+        summary = ", ".join(f"{action}: {counts[action]}" for action in sorted(counts))
+        lines.append(f"artifacts: {summary}")
+    for project in plan.projects:
+        chosen = f" selected={project.selected_alias or project.selected_digest or '-'}"
+        lines.append(f"project {project.canonical} ({project.key}):"
+                     f" aliases={list(project.aliases)}{chosen}")
+    for label, items in (
+        ("blocker", plan.blockers),
+        ("report", plan.reports),
+        ("reset", plan.resets),
+    ):
+        for item in items:
+            lines.append(f"{label}: {item}")
+    for alias, verdict in plan.preferences:
+        lines.append(f"preference: {alias} ({verdict})")
+    if read_only:
+        lines.append("read-only plan: nothing was written")
+    return "\n".join(lines)
+
+
+_APPLY_WINDOW_TEXT = """\
+apply requires an offline maintenance window (rc unchanged, nothing written):
+  1. close every Claude Code and Codex session on this machine
+  2. stop detached learnings workers
+  3. rerun: learn state import --apply --yes --offline-maintenance
+  4. restart sessions only after activation completes
+The flags are confirmation gates, not synchronization (a still-running host
+can spawn a worker at any moment); the live-worker census and the granular
+lock probes inside apply are the defense-in-depth. The exclusive activity
+lock is held from acquisition through the activation write — expect the
+whole apply to run inside it (seconds, not minutes)."""
+
+
+def _cmd_state_apply(args: argparse.Namespace, status, legacy_root: Path) -> int:
+    """`learn state import --apply` — the ONE activation writer (Part 3C).
+
+    Gate order per the plan: confirmation flags -> apply-on-VALID refusal
+    (BEFORE any planning) -> try_activity_exclusive() -> the module's
+    apply_import (plan recompute, census, lock probes, staging, publication,
+    re-gate, activation, self-check). `state` stays OUT of the CLI's
+    mutating_commands: the shared blocking lock those take cannot upgrade
+    to exclusive, so apply acquires its own exclusive lock here."""
+    if not (args.yes and args.offline_maintenance):
+        print(_APPLY_WINDOW_TEXT, file=sys.stderr)
+        return 2
+    if status.state == STATE.ACTIVATION_VALID:
+        # Decision 2: refused BEFORE plan_import ever runs. Identical
+        # inventory -> no-op; drift -> report-only, never re-imported.
+        record = STATE.active_generation_record() or {}
+        recorded = record.get("source_inventory_digest")
+        if recorded and legacy_root.is_dir() and recorded != STATE.source_inventory_digest(legacy_root):
+            print(f"already active (generation {status.generation}); legacy drift detected")
+            print(
+                "the changed legacy bytes are reported only and never re-imported "
+                "over neutral state; to reseed from legacy, run "
+                "`learn state rollback --yes` first (the current neutral "
+                f"generation {status.generation} is preserved, not deleted)"
+            )
+            return 1
+        print(f"already active (generation {status.generation}); apply is a no-op")
+        return 0
+    preserved = STATE.deactivated_generation()
+    if preserved is not None:
+        print(
+            f"a preserved prior neutral generation exists ({preserved}, via "
+            f"deactivated.json). This apply is a one-way legacy reseed, not a "
+            f"semantic merge: it builds a NEW generation from the legacy tree "
+            f"and never overlays or deletes the preserved one — generation "
+            f"{preserved} remains on disk as a tree under generations/, but "
+            f"its reactivate entry is superseded once this apply activates "
+            f"(the next rollback overwrites deactivated.json with the new "
+            f"record). To restore it instead of reseeding, abort now (do not "
+            f"pass --yes) and run `learn state reactivate --yes` first."
+        )
+    lock = STATE.try_activity_exclusive()
+    if lock is None:
+        print(
+            "cannot acquire the exclusive state activity lock — a learnings "
+            "worker or session still holds it.",
+            file=sys.stderr,
+        )
+        print(_APPLY_WINDOW_TEXT, file=sys.stderr)
+        return 1
+    try:
+        outcome = STATE.apply_import(
+            legacy_root, prefer_portable=tuple(args.prefer_portable or ())
+        )
+    finally:
+        lock.close()
+    if outcome.plan is not None:
+        print(_render_import_plan(outcome.plan, read_only=False))
+    for note in outcome.notes:
+        print(f"note: {note}")
+    for blocker in outcome.blockers:
+        print(f"apply blocker: {blocker}")
+    if outcome.status == "activated":
+        print(f"activated generation {outcome.generation}")
+        return 0
+    if outcome.status == "staged-not-activated":
+        print(
+            f"generation {outcome.generation} is staged but NOT activated; "
+            f"legacy state remains live"
+        )
+        return 1
+    print("apply blocked; nothing was activated and legacy state remains live")
+    return 1
+
+
+def _acquire_state_transition_lock():
+    """Exclusive activity lock for a transition verb, or None + message.
+    Shared with rollback/reactivate; apply prints its own richer message."""
+    lock = STATE.try_activity_exclusive()
+    if lock is None:
+        print(
+            "cannot acquire the exclusive state activity lock — a learnings "
+            "worker or session still holds it; nothing was changed. Retry "
+            "once the machine is quiet.",
+            file=sys.stderr,
+        )
+    return lock
+
+
+def _cmd_state_rollback(args: argparse.Namespace) -> int:
+    """`learn state rollback --yes` — under the exclusive activity lock, one
+    atomic replace deactivates; both trees (neutral generation AND legacy)
+    are preserved untouched. Post-rollback re-import is a one-way legacy
+    reseed, never a semantic merge (see the apply messaging)."""
+    if not args.yes:
+        print(
+            "rollback deactivates the neutral state (legacy resumes on the "
+            "next resolution); rerun with --yes to confirm",
+            file=sys.stderr,
+        )
+        return 2
+    lock = _acquire_state_transition_lock()
+    if lock is None:
+        return 1
+    try:
+        verdict, generation, snapshot_warning = STATE.rollback_activation()
+    finally:
+        lock.close()
+    if verdict == "blocked":
+        print(f"rollback blocker: {snapshot_warning or 'transition refused'}", file=sys.stderr)
+        return 1
+    if verdict == "absent":
+        print("no activation record; nothing to deactivate (no-op)")
+        return 0
+    if snapshot_warning is not None:
+        print(
+            f"warning: rollback-time snapshot could not be captured "
+            f"({snapshot_warning}); `learn state reactivate` will verify "
+            f"against the original import manifest and will refuse a "
+            f"lived-in (drifted) generation",
+            file=sys.stderr,
+        )
+    name = generation or "an invalid activation record"
+    print(f"deactivated: {name} (preserved as deactivated.json; the generation tree is untouched)")
+    print("legacy state resumes; `learn state reactivate --yes` restores this exact generation")
+    return 0
+
+
+def _cmd_state_abandon_external(args: argparse.Namespace) -> int:
+    """Report or perform the deliberately named machine break-glass path."""
+    if args.apply or args.offline_maintenance:
+        print(
+            "state rollback --abandon-external accepts only --yes; --apply and --offline-maintenance are invalid",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        plan = STATE.plan_abandon_external_corpora()
+    except ValueError as exc:
+        print(f"rollback blocker: {exc}", file=sys.stderr)
+        return 1
+    if not plan.records:
+        return _cmd_state_rollback(args)
+    print("external authorities to abandon:")
+    for key, active, digest, size, roots, revisions, pending in plan.records:
+        action = "finish pending abandonment" if pending else f"move {active} -> deactivated.json"
+        print(f"  {key}: {action}")
+        if digest is not None and size is not None:
+            print(f"    raw authority: sha256={digest} size={size}")
+        print(f"    observed roots: {', '.join(roots) if roots else '(unreadable or malformed)'}")
+        print(f"    preserved revisions: {', '.join(revisions) if revisions else '(none safely listed)'}")
+    if not args.yes:
+        print(
+            "break-glass is report-first: rerun `learn state rollback --abandon-external --yes`; nothing was written",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        moved = STATE.abandon_external_corpora(plan)
+    except STATE._ProjectCorpusTransitionBlocked as exc:
+        for blocker in exc.blockers:
+            print(f"rollback blocker: {blocker}", file=sys.stderr)
+        return 1
+    for key in moved:
+        print(f"abandoned external authority: {key} (raw record preserved as deactivated.json)")
+    return _cmd_state_rollback(args)
+
+
+def _cmd_state_reactivate(args: argparse.Namespace) -> int:
+    """`learn state reactivate --yes` — restores the preserved record after
+    full digest re-verification of its generation; never selects an
+    arbitrary generation and never merges legacy drift."""
+    if not args.yes:
+        print(
+            "reactivate restores the preserved neutral generation; legacy-only "
+            "changes made since rollback stay in the legacy tree (they are "
+            "NOT merged). Rerun with --yes to confirm",
+            file=sys.stderr,
+        )
+        return 2
+    lock = _acquire_state_transition_lock()
+    if lock is None:
+        return 1
+    try:
+        verdict, generation, notes = STATE.reactivate_deactivated()
+    finally:
+        lock.close()
+    if verdict == "blocked":
+        # Fatal reasons are show-stoppers, not informational notes.
+        for item in notes:
+            print(f"reactivate blocker: {item}", file=sys.stderr)
+        print("reactivate refused; nothing was changed", file=sys.stderr)
+        return 1
+    for note in notes:
+        print(f"note: {note}")
+    if verdict == "already-active":
+        print(f"already active (generation {generation}); nothing to do")
+        return 0
+    if verdict == "nothing-to-reactivate":
+        print("no deactivated.json record; nothing to reactivate")
+        return 1
+    print(f"reactivated generation {generation}")
+    return 0
+
+
+def _archive_records_attachments_text(entry) -> str:
+    labels = list(entry.attachments)
+    if entry.archive_corpus:
+        labels.append("corpus")
+    return ",".join(labels) if labels else "-"
+
+
+def _print_archive_records_plan(mode: str, catalog_root: Path, plan) -> bool:
+    """Print the classification report; returns whether anything was refused
+    or unreadable. The caller combines that with `bool(keys)` into
+    `explicit_shortfall` — a `--key` run that named a record which turned out
+    refused or unknown failed the user's explicit request; an automatic
+    (--key-less) run's refusals/unreadables are expected classification
+    outcomes, not errors."""
+    print(f"learn state archive-records ({mode}) — catalog: {catalog_root}")
+    for entry in plan.candidates:
+        print(f"{entry.key}  {entry.cls}  {entry.display}  {_archive_records_attachments_text(entry)}")
+    for entry in plan.refused:
+        print(f"refused: {entry.key}  {entry.cls}  {entry.display}")
+    for item in plan.unreadable:
+        print(f"unreadable: {item.key}  {item.reason}")
+
+    counts: dict[str, int] = {}
+    for entry in plan.candidates:
+        counts[entry.cls] = counts.get(entry.cls, 0) + 1
+    summary = ", ".join(f"{cls}: {counts[cls]}" for cls in sorted(counts)) if counts else "none"
+    print(f"candidates: {summary}")
+    if plan.refused:
+        print(f"refused: {len(plan.refused)}")
+    if plan.unreadable:
+        print(f"unreadable: {len(plan.unreadable)}")
+    return bool(plan.refused or plan.unreadable)
+
+
+def _cmd_state_archive_records(args: argparse.Namespace) -> int:
+    """`learn state archive-records` — archive dead catalog records (temp
+    pytest-scratch registrations, ghost records with no live observed root)
+    out of `projects/<key>` into `<archive_root>/projects/<key>`.
+
+    `archive_root` is a sibling of `corpora/` under the neutral state root
+    (`<neutral>/archive`), never a path inside the active generation
+    directory that rollback snapshots digest: production derives it from
+    `STATE.corpora_root()` (`.parent / "archive"`); if that's unavailable
+    (legacy fallback), it derives from `catalog_root / "archive"` instead,
+    matching the corpora fallback. `--neutral-root` is a test override: it
+    stands in for the whole catalog root, so `PATH/projects`, `PATH/corpora`,
+    and `PATH/archive` are used directly, without needing an
+    activation/generation fixture (mirrors `learnings-retire.sh
+    --neutral-root`'s test-isolation role).
+
+    Stays out of `mutating_commands` like the rest of `state`: `--apply`
+    manages its own EXCLUSIVE activity lock instead of the shared blocking
+    one those take (matching `_cmd_state_apply`'s rationale — a shared hold
+    can't be upgraded to exclusive mid-command). The plan is computed AFTER
+    the lock is acquired (never before) so a writer can't mutate a record in
+    the window between classification and move; the dry-run path stays
+    lock-free, since it never moves anything."""
+    keys = list(dict.fromkeys(args.key or [])) or None
+    if args.neutral_root:
+        catalog_root = Path(args.neutral_root).resolve()
+        corpora_root = catalog_root / "corpora"
+        archive_root = catalog_root / "archive"
+    else:
+        catalog_root = STATE.state_paths().root
+        neutral_corpora_root = STATE.corpora_root()
+        if neutral_corpora_root is None:
+            corpora_root = catalog_root / "corpora"
+            archive_root = catalog_root / "archive"
+        else:
+            corpora_root = neutral_corpora_root
+            archive_root = corpora_root.parent / "archive"
+
+    mode = "apply" if args.apply else "dry-run"
+
+    if not args.apply:
+        plan = STATE.plan_archive_records(catalog_root, corpora_root, keys=keys)
+        has_refused = _print_archive_records_plan(mode, catalog_root, plan)
+        explicit_shortfall = bool(keys) and has_refused
+        print("dry-run: nothing moved")
+        return 1 if explicit_shortfall else 0
+
+    if not args.yes:
+        sys.stderr.write(
+            "error: --apply requires --yes (refusing to archive without "
+            "explicit confirmation).\n"
+        )
+        return 2
+
+    lock = STATE.try_activity_exclusive()
+    if lock is None:
+        print(
+            "cannot acquire the exclusive state activity lock — a learnings "
+            "worker or session still holds it; nothing was changed. Retry "
+            "once the machine is quiet.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        plan = STATE.plan_archive_records(catalog_root, corpora_root, keys=keys)
+        has_refused = _print_archive_records_plan(mode, catalog_root, plan)
+        explicit_shortfall = bool(keys) and has_refused
+        result = STATE.apply_archive_records(archive_root, plan.candidates)
+    finally:
+        lock.close()
+
+    for archived in result.applied:
+        corpus_note = ""
+        if archived.corpus_destination is not None:
+            corpus_note = (
+                f" (+corpus -> {archived.corpus_destination})"
+                if archived.corpus_archived
+                else " (corpus NOT archived — see error)"
+            )
+        print(f"archived: {archived.key} ({archived.cls}) -> {archived.destination}{corpus_note}")
+    for error in result.errors:
+        print(f"error: {error.key}: {error.reason}", file=sys.stderr)
+    print(f"applied {len(result.applied)}/{len(plan.candidates)} candidate(s); {len(result.errors)} error(s)")
+
+    if result.errors or explicit_shortfall:
+        return 1
+    return 0
+
+
+def cmd_state(args: argparse.Namespace) -> int:
+    """`learn state <action>` — status/import stay read-only, direct module
+    API (decision 4 / parent Task 4) and never take the activity lock.
+    apply/rollback/reactivate are the Part 3C transition verbs: apply takes
+    its own EXCLUSIVE activity lock (see _cmd_state_apply)."""
+    if getattr(args, "abandon_external", False) and args.action != "rollback":
+        print("--abandon-external is valid only with `learn state rollback`", file=sys.stderr)
+        return 2
+    if args.action == "archive-records":
+        return _cmd_state_archive_records(args)
+    status = STATE.activation_status()
+    if args.action == "status" and getattr(args, "mode_only", False):
+        # Decision 12: one machine-readable token for deploy.sh's mode
+        # probe. An invalid record is never authoritative, so anything
+        # short of VALID answers `legacy`.
+        print("neutral" if status.state == STATE.ACTIVATION_VALID else "legacy")
+        return 0
+    if status.state == STATE.ACTIVATION_VALID:
+        # status.root is the generation root when valid; the legacy source
+        # root still comes from the same module resolution (silent here —
+        # state_paths only warns on an invalid record).
+        legacy_root = STATE.state_paths().legacy_root
+    else:
+        legacy_root = status.root
+    if args.action == "rollback":
+        if getattr(args, "abandon_external", False):
+            return _cmd_state_abandon_external(args)
+        return _cmd_state_rollback(args)
+    if args.action == "reactivate":
+        return _cmd_state_reactivate(args)
+    if args.action == "import" and getattr(args, "apply", False):
+        return _cmd_state_apply(args, status, legacy_root)
+    if args.action == "status":
+        print(f"activation: {status.state}")
+        if status.record_path is not None:
+            print(f"record: {status.record_path}")
+        if status.generation is not None:
+            print(f"generation: {status.generation}")
+        if status.reason:
+            print(f"reason: {status.reason}")
+        mode = "neutral" if status.state == STATE.ACTIVATION_VALID else "legacy"
+        print(f"runtime mode: {mode}")
+        if status.state == STATE.ACTIVATION_INVALID:
+            print("an invalid activation record is never authoritative; "
+                  "runtime stays on legacy state")
+        for row in STATE.inspect_active_corpus_authority():
+            print(f"project corpus {row['project_key']}: {row['status']}")
+        try:
+            abandonment = STATE.plan_abandon_external_corpora()
+        except ValueError as exc:
+            print(f"project corpus abandonment evidence: malformed — {exc}")
+            return 1
+        for key, _active, _digest, _size, _roots, _revisions, phase in abandonment.records:
+            if phase == "pending":
+                print(f"project corpus {key}: pending-abandonment")
+        # Light diagnostic by design: one inventory walk, no git probes, no
+        # artifact validation. The full plan (and its blockers) belongs to
+        # `learn state import` — a wedged repo must not stall status.
+        generation_record = STATE.active_generation_record()
+        recorded = (generation_record or {}).get("source_inventory_digest")
+        if (
+            recorded
+            and legacy_root.is_dir()
+            and recorded != STATE.source_inventory_digest(legacy_root)
+        ):
+            print("legacy drift: the legacy source inventory no longer matches "
+                  "the active generation (reported only; never re-imported)")
+        print("run `learn state import` for the full read-only import plan")
+        return 0
+    plan = STATE.plan_import(legacy_root, prefer_portable=tuple(args.prefer_portable or ()))
+    print(_render_import_plan(plan))
+    return 1 if (plan.blockers or plan.source_changed) else 0
+
+
+def cmd_metrics(args: argparse.Namespace) -> int:
+    """F2 v1: passive observation of corpus health.
+
+    Pure read; no Sonnet calls, no new state. Surfaces:
+    - per-file: entries, sections, ref-count, oldest/newest tagged date
+    - cross-file: totals, # files with no refs (cold)
+    """
+    try:
+        cwd = _resolve_consumer_cwd(args.cwd)
+        location = _strict_corpus_location(cwd)
+    except _CorpusConsumerError:
+        return 1
+    if location is None:
+        location = _legacy_consumer_location(cwd)
+    if location.mode == "legacy-repository":
+        files = _learnings_files(location.corpus_root)
+        if not files:
+            print(f"No learnings found in {cwd}")
+            return 0
+        file_metrics = [metric for metric in (_collect_file_metrics(path) for path in files) if metric]
+        output_root = cwd
+    else:
+        snapshots = _location_snapshots(location)
+        if snapshots is None:
+            return 1
+        if not snapshots:
+            print(f"No learnings found in {cwd}")
+            return 0
+        file_metrics = [_collect_snapshot_metrics(snapshot) for snapshot in snapshots]
+        output_root = location.project_root
+
+    total_entries = sum(m["entries"] for m in file_metrics)
+    total_size = sum(m["size_bytes"] for m in file_metrics)
+    cold_files = sum(
+        1 for m in file_metrics if not m["ref_count"]
+    )
+    all_dates = sorted(
+        d
+        for m in file_metrics
+        for d in (m["oldest_date"], m["newest_date"])
+        if d is not None
+    )
+    corpus_oldest = all_dates[0] if all_dates else None
+    corpus_newest = all_dates[-1] if all_dates else None
+
+    print(f"Corpus health for {output_root}")
+    print(f"  Files: {len(file_metrics)}")
+    print(f"  Total entries: {total_entries}")
+    print(f"  Total size: {total_size / 1024:.1f} KB")
+    if corpus_oldest:
+        print(f"  Date range: {corpus_oldest} → {corpus_newest}")
+    if cold_files:
+        print(
+            f"  Cold files (no ref-count yet): {cold_files} "
+            "(never returned by `learn search`)"
+        )
+    print()
+
+    print("By file:")
+    for m in file_metrics:
+        ref_part = (
+            f"{m['ref_count']} refs" if m["ref_count"] else "no refs"
+        )
+        date_part = ""
+        if m["oldest_date"]:
+            date_part = f", {m['oldest_date']}→{m['newest_date']}"
+        print(
+            f"  {m['name']}: {m['entries']} entries, "
+            f"{m['sections']} sections, {ref_part}"
+            f" ({m['tagged_count']} tagged{date_part})"
+        )
+    return 0
+
+
+# --- Quiet corpus Stage 1 §4: `learn stats` ------------------------
+
+_STATS_RECENT_WINDOW_DAYS = 14
+_STATS_TOP_REPEATS = 10
+
+
+def _stats_entry_lines(corpus_root: Path) -> list[str]:
+    """`- `-prefixed entry lines counted for `learn stats`: from every
+    `LEARNINGS-*.md` topic subfile when any exist (index mode — LEARNINGS.md
+    itself is excluded, since its `- [topic](file)` rows are structure, not
+    entries); falls back to LEARNINGS.md directly for a flat monolith corpus
+    with no subfiles."""
+    subfiles = sorted(corpus_root.glob("LEARNINGS-*.md"))
+    targets = subfiles if subfiles else [corpus_root / "LEARNINGS.md"]
+    lines: list[str] = []
+    for path in targets:
+        body = _safe_read_text(path)
+        if body is None:
+            continue
+        lines.extend(line for line in body.splitlines() if line.strip().startswith("- "))
+    return lines
+
+
+def _stats_recent_count(lines: list[str], now: dt.datetime, window_days: int = _STATS_RECENT_WINDOW_DAYS) -> int:
+    """Entries whose tag date (YYYY-MM-DDTHH:MMZ, date part only) falls
+    within the last `window_days` of `now`. Calendar-date comparison, not
+    datetime: a tag carries no time-of-day (parses at midnight), so
+    comparing against a `now`-derived cutoff at its actual time-of-day
+    would drop entries dated exactly `window_days` ago whenever `now` is
+    after midnight — which is effectively always."""
+    cutoff_date = (now - dt.timedelta(days=window_days)).date()
+    count = 0
+    for line in lines:
+        date_str = _parse_session_tag_date(line.strip())
+        if date_str is None:
+            continue
+        try:
+            parsed_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if parsed_date >= cutoff_date:
+            count += 1
+    return count
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """`learn stats [--cwd PATH]`: entries, entries in the last 14 days,
+    `learn search` runs against this project (`searches.json`, not the
+    index file's ref-count, which only moved when the index itself matched
+    a query), and the top 10 repeat ids. Read-only. Two weeks of these
+    numbers decide what, if anything, comes back (Stage 1 §5)."""
+    try:
+        cwd = _resolve_consumer_cwd(args.cwd)
+        location = _strict_corpus_location(cwd)
+    except _CorpusConsumerError:
+        return 1
+    if location is None:
+        location = _legacy_consumer_location(cwd)
+    corpus_root = location.corpus_root
+
+    lines = _stats_entry_lines(corpus_root)
+
+    transcript_dir = _default_transcript_dir(cwd)
+    repeats: dict[str, int] = {}
+    if transcript_dir is not None:
+        try:
+            with open(transcript_dir / "repeats.json", encoding="utf-8") as f:
+                data = json.loads(f.read())
+            if isinstance(data, dict):
+                repeats = {k: v for k, v in data.items() if isinstance(v, int)}
+        except (OSError, json.JSONDecodeError):
+            repeats = {}
+
+    print(f"entries: {len(lines)}")
+    print(f"entries last 14 days: {_stats_recent_count(lines, dt.datetime.now(dt.UTC))}")
+    print(f"searches: {_read_search_count(transcript_dir)}")
+    if repeats:
+        top = sorted(repeats.items(), key=lambda kv: kv[1], reverse=True)[:_STATS_TOP_REPEATS]
+        print("repeats: " + ", ".join(f"{entry_id} {count}" for entry_id, count in top))
+    else:
+        print("repeats: none")
+    return 0
+
+
+# --- F4-B v1: cleanup ---------------------------------------------
+
+# Allowlist of file extensions we own in the transcript dir. Enforced
+# strictly — anything not here (jsonl, subagent dirs, auto-memory dir,
+# etc.) is left alone. NOTE: `.cache.json` and `.turnstate.json` ARE
+# owned — see the Task 7 block below (`_CLEANUP_OWNED_EXTS`) for the
+# current list; don't infer ownership from this sentence.
+# Codex F4-B round-1: .review-lock and .validation-lock are EXCLUDED.
+# They are flock targets used to serialize concurrent writers across
+# sessions and auto-split. Even with the session-keyed jsonl-fresh
+# protection, deleting a lock has a TOCTOU window — a process can
+# flock the path post-plan, cleanup unlinks, the next opener creates
+# a different inode and bypasses serialization, and two supposedly
+# serialized writers can run concurrently against shared LEARNINGS
+# state. v1 leaves them in place (0-byte files; aging benefit is
+# directory clutter, not worth the data-loss risk).
+#
+# .prune-report is EXCLUDED (Codex F4-B round-5 reasoning): its writer
+# publishes via os.replace(), so even with the round-3 (mtime/inode)
+# and round-4 (companion jsonl) revalidation, a microsecond race exists
+# between the final lstat and os.unlink — os.replace can land in that
+# window and we'd unlink the fresh report.
+# .validation-report and .consolidation-report were excluded for the
+# same reason while their writers existed; those writers were retired
+# in the 2026-08-01 corpus simplification, so the stale artifacts they
+# left in every project's transcript dir are now sweepable.
+#
+# Task 7 (deterministic SessionStart delivery): `.turnstate.json` is the
+# hook's per-session turn-boundary store (see hooks/learning-hook.py's
+# load_turnstate/mutate_turnstate); `.cache.json` is the legacy
+# transcript cache it replaced — the hook no longer writes it, but old
+# sessions left copies behind. Both are now owned/session-keyed, same
+# aging rule as every other marker here. `.turnstate.lock` (the sibling
+# flock file mutate_turnstate opens) is deliberately NOT added: it is a
+# flock target with the exact same TOCTOU risk as .review-lock /
+# .validation-lock above, so it stays excluded for the same reason.
+_CLEANUP_OWNED_EXTS: tuple[str, ...] = (
+    ".last-review",
+    ".last-review-attempt",
+    ".validate-pending",
+    ".compact-marker",
+    ".split-done",
+    ".split-stage-1-done",
+    ".split-stage-2-done",
+    ".split-stage-3-done",
+    ".split-pending-notify",
+    ".split-failed",
+    ".validation-report",
+    ".consolidation-report",
+    ".turnstate.json",
+    ".cache.json",
+    # hooks/learning-on-failure.py: once-per-session throttle marker for
+    # the generic no-hit nudge.
+    ".failure-nudge-shown",
+)
+
+# Extensions that are session-keyed (UUID-prefixed). Aging out is
+# gated on the corresponding `<uuid>.jsonl` also being stale (or
+# absent) so we don't strip markers from an idle-but-resumable
+# session.
+_CLEANUP_SESSION_KEYED_EXTS: frozenset[str] = frozenset(
+    {
+        ".last-review",
+        ".last-review-attempt",
+        ".validate-pending",
+        ".compact-marker",
+        ".split-done",
+        ".split-stage-1-done",
+        ".split-stage-2-done",
+        ".split-stage-3-done",
+        ".split-pending-notify",
+        ".split-failed",
+        ".validation-report",
+        # .consolidation-report is topic-keyed, not session-keyed:
+        # it ages out on mtime alone (its writer is retired, so any
+        # surviving copy is stale).
+        ".turnstate.json",
+        ".cache.json",
+        # hooks/learning-on-failure.py: once-per-session throttle marker for
+        # the generic no-hit nudge.
+        ".failure-nudge-shown",
+    }
+)
+
+# 8-4-4-4-12 hex form (Claude Code session-id pattern).
+_UUID_PREFIX_RE = re.compile(
+    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\."
+)
+
+
+def _cleanup_plan(transcript_dir: Path, days: int) -> list[dict]:
+    """Compute the deletion plan for `transcript_dir` at threshold `days`.
+
+    Returns a list of dicts: {"path": Path, "reason": str, "kind": str}.
+    Pure: stat-only; no deletion.
+
+    Safety contract:
+    - Only files whose suffix appears in `_CLEANUP_OWNED_EXTS` are
+      considered. Foreign files (`*.jsonl`, subagent dirs, anything
+      not in that tuple) are skipped silently. `.cache.json` and
+      `.turnstate.json` ARE owned (Task 7) — not foreign.
+    - Symlinks are skipped (no follow).
+    - Session-keyed files are skipped if a same-UUID `<uuid>.jsonl`
+      exists with mtime newer than the cutoff.
+    """
+    if not transcript_dir.is_dir():
+        return []
+    cutoff = time.time() - days * 86400
+    out: list[dict] = []
+
+    # Build session→jsonl-mtime map once (allowlisted dir scan, single pass).
+    jsonl_mtimes: dict[str, float] = {}
+    for entry in os.scandir(transcript_dir):
+        if not entry.name.endswith(".jsonl"):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        sid = entry.name[: -len(".jsonl")]
+        jsonl_mtimes[sid] = max(jsonl_mtimes.get(sid, 0.0), st.st_mtime)
+
+    for entry in os.scandir(transcript_dir):
+        name = entry.name
+        # Match longest-suffix-first against the allowlist. Some of our
+        # extensions are multi-segment (e.g. .split-stage-1-done) — a
+        # naive rsplit("." 1) would only match ".done" or ".1-done".
+        matched_ext = None
+        for ext in _CLEANUP_OWNED_EXTS:
+            if name.endswith(ext):
+                matched_ext = ext
+                break
+        if matched_ext is None:
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            continue  # symlinks, FIFOs, dirs — skip
+        if st.st_mtime >= cutoff:
+            continue
+        sid: str | None = None
+        if matched_ext in _CLEANUP_SESSION_KEYED_EXTS:
+            m = _UUID_PREFIX_RE.match(name)
+            if m is None:
+                # Session-keyed extension but no UUID prefix — leave it.
+                # Could be operator scratch; safer to skip.
+                continue
+            sid = m.group(1)
+            # Codex F4-B round-6 [medium]: real markers are EXACTLY
+            # `<uuid><ext>`. `name.endswith(ext)` would accept noise
+            # like `<uuid>.notes.last-review` (operator scratch with
+            # an owned-looking suffix). Require the exact shape.
+            if name != f"{sid}{matched_ext}":
+                continue
+            jsonl_mtime = jsonl_mtimes.get(sid)
+            if jsonl_mtime is not None and jsonl_mtime >= cutoff:
+                continue  # session resumable; protect its markers
+            reason = (
+                "orphaned (no jsonl)" if jsonl_mtime is None
+                else "jsonl also stale"
+            )
+        else:
+            reason = "topic-keyed, mtime-based"
+        # Codex F4-B round-3: capture (dev, inode, mtime) so the
+        # apply path can detect refresh / replacement between plan
+        # and unlink.
+        # Codex F4-B round-4: also carry sid + transcript dir so apply
+        # can re-check jsonl freshness per session-keyed entry.
+        # ctime: dev/inode alone assumes unlink+recreate always gets a
+        # fresh inode — true on APFS but not guaranteed (some Linux
+        # filesystems reuse a just-freed inode for the next create in
+        # the same directory, defeating that check). ctime is bumped
+        # by any metadata change, including the replacement's own
+        # os.utime/write, so it catches the swap even when the inode
+        # number coincides.
+        out.append(
+            {
+                "path": Path(entry.path),
+                "reason": reason,
+                "kind": matched_ext,
+                "dev": st.st_dev,
+                "inode": st.st_ino,
+                "mtime": st.st_mtime,
+                "ctime": st.st_ctime,
+                "sid": sid,
+                "transcript_dir": Path(transcript_dir),
+            }
+        )
+    return out
+
+
+def _apply_cleanup(plan: list[dict], days: int) -> tuple[int, int]:
+    """Execute the deletion plan with per-entry revalidation.
+
+    Returns (deleted, skipped). Skips an entry if any of:
+    - The path no longer exists (already gone).
+    - lstat fails or the entry is no longer a regular file.
+    - dev/inode changed since plan (file was replaced).
+    - ctime changed since plan (metadata touched — catches a same-
+      inode replacement on filesystems that recycle a just-freed
+      inode for the next create, which dev/inode alone would miss).
+    - mtime moved forward past the cutoff (refreshed by a hook).
+    - For session-keyed entries: the companion `<sid>.jsonl` now
+      exists with mtime newer than cutoff (session became resumable).
+    Codex F4-B round-3 + round-4: closes the obvious TOCTOU windows
+    between `_cleanup_plan` and the actual unlink.
+
+    Residual race (accepted in v1, Codex F4-B round-6 [high]): there
+    is still a microsecond window between the final lstat checks
+    and `os.unlink` during which a stale session could resume and
+    a hook could recreate one of its markers. The window is two
+    adjacent syscalls in this loop; the harm if hit is one missed
+    marker (recoverable on the next hook fire). Closing this fully
+    requires cooperative locking across every marker writer
+    (including hook scripts that don't currently take any lock),
+    which is v2 work.
+    """
+    cutoff = time.time() - days * 86400
+    deleted = 0
+    skipped = 0
+    for entry in plan:
+        path = entry["path"]
+        try:
+            st = os.lstat(str(path))
+        except FileNotFoundError:
+            skipped += 1
+            continue
+        except OSError:
+            skipped += 1
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            skipped += 1
+            continue
+        if st.st_dev != entry["dev"] or st.st_ino != entry["inode"]:
+            skipped += 1
+            continue
+        if st.st_ctime != entry["ctime"]:
+            skipped += 1
+            continue
+        if st.st_mtime >= cutoff:
+            skipped += 1
+            continue
+        # Codex F4-B round-4: per-entry jsonl freshness recheck for
+        # session-keyed markers. A session that became resumable
+        # AFTER the plan (jsonl created or refreshed) must protect
+        # its still-stale markers.
+        sid = entry.get("sid")
+        if sid is not None:
+            jsonl = entry["transcript_dir"] / f"{sid}.jsonl"
+            try:
+                jst = os.lstat(str(jsonl))
+            except FileNotFoundError:
+                jst = None
+            except OSError:
+                jst = None
+            if (
+                jst is not None
+                and stat.S_ISREG(jst.st_mode)
+                and jst.st_mtime >= cutoff
+            ):
+                skipped += 1
+                continue
+        try:
+            os.unlink(str(path))
+            deleted += 1
+        except OSError:
+            skipped += 1
+    return deleted, skipped
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    """F4-B v1: delete stale transient artifacts (markers, locks,
+    consolidation reports) older than `--days`.
+
+    Dry-run by default. `--apply` executes; without a TTY, also requires
+    `--yes`. Only files matching our owned-extension allowlist are
+    eligible; session-keyed files are protected while their jsonl is
+    still fresh (resumable session).
+    """
+    # Codex F4-B round-2: reject non-positive --days. With days <= 0
+    # the cutoff collapses to now (or the future), defeating the
+    # jsonl-freshness guard — active markers and their fresh jsonls
+    # all look stale.
+    if args.days < 1:
+        sys.stderr.write(
+            f"error: --days must be a positive integer (got {args.days}); "
+            "0 or negative would treat live sessions as stale.\n"
+        )
+        return 2
+
+    cwd = Path(args.cwd or ".").resolve()
+    if args.transcript_dir:
+        td = Path(args.transcript_dir)
+    else:
+        td_opt = _default_transcript_dir(cwd)
+        if td_opt is None:
+            print(f"No transcript dir found for {cwd}")
+            return 0
+        td = td_opt
+
+    plan = _cleanup_plan(td, days=args.days)
+    if not plan:
+        print(f"Nothing to clean up in {td} (threshold: {args.days}d).")
+        return 0
+
+    apply = bool(args.apply)
+    mode = "apply" if apply else "dry-run"
+    print(f"learn cleanup ({mode}) — {len(plan)} file(s) eligible (>{args.days}d):")
+    for entry in plan:
+        print(f"  {entry['path'].name}  [{entry['kind']}]  ({entry['reason']})")
+    print(f"target dir: {td}")
+
+    if not apply:
+        print("Re-run with --apply to delete. Add --yes for non-interactive.")
+        return 0
+
+    if not sys.stdin.isatty() and not args.yes:
+        sys.stderr.write(
+            "error: --apply on a non-TTY requires --yes (refusing to "
+            "delete without explicit confirmation).\n"
+        )
+        return 2
+
+    deleted, skipped = _apply_cleanup(plan, days=args.days)
+    if skipped:
+        print(
+            f"Deleted {deleted}/{len(plan)} file(s); "
+            f"{skipped} skipped (refreshed/replaced/missing since plan)."
+        )
+    else:
+        print(f"Deleted {deleted}/{len(plan)} file(s).")
+    return 0
+
+
+def _git_toplevel_or_none(cwd: Path) -> Path | None:
+    """`git rev-parse --show-toplevel` from `cwd`, or None outside a repo
+    (or when git is unavailable) — mirrors
+    `hooks/learning-on-start.py::_resolve_root`."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip()).resolve()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _resolve_cwd_toplevel(cwd_arg: str | None) -> Path:
+    """`--cwd` resolved to the git toplevel first, falling back to the path
+    itself outside a repo (decisions 8, 10 — the corpus files and the
+    recorded diagnostics `project_path` both live at the root)."""
+    cwd = Path(cwd_arg or ".").resolve()
+    return _git_toplevel_or_none(cwd) or cwd
+
+
+def _git_head(cwd: Path) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _render_corpus_sync_snapshot(snapshot) -> int:
+    """Render the shared external inspection result without reclassifying it."""
+    print(f"synchronization: {snapshot.state}")
+    print(f"project root: {snapshot.project_root}")
+    print(
+        f"projection: {snapshot.projection_id} "
+        f"revision={snapshot.projection_revision or '(missing)'}"
+    )
+    for label, names in (
+        ("repository added", snapshot.repository_added),
+        ("repository removed", snapshot.repository_removed),
+        ("repository changed", snapshot.repository_changed),
+        ("external added", snapshot.external_added),
+        ("external removed", snapshot.external_removed),
+        ("external changed", snapshot.external_changed),
+    ):
+        for name in names:
+            print(f"{label}: {name}")
+    for blocker in snapshot.blockers:
+        print(f"blocked: {blocker}", file=sys.stderr)
+    if snapshot.state == "unprojected":
+        print(
+            "no checkout projection exists; inspect `learn corpus import`, `learn corpus publish`, or "
+            "`learn corpus unpublish` before synchronizing",
+            file=sys.stderr,
+        )
+    elif snapshot.state == "pending-stale":
+        print(
+            "checkout projection is stale; inspect `learn corpus import`, `learn corpus publish`, or "
+            "`learn corpus unpublish` before synchronizing",
+            file=sys.stderr,
+        )
+    elif snapshot.state == "sync-recovery-pending":
+        print(
+            "pending synchronization must be recovered with the same `learn corpus publish|unpublish --apply --yes` "
+            "operation; a blocked publish may be explicitly superseded with `--replace-repository`",
+            file=sys.stderr,
+        )
+    return STATE.CORPUS_SYNC_POLICY[snapshot.state][0]
+
+
+def cmd_corpus(args: argparse.Namespace) -> int:
+    """`learn corpus baseline|drift` (decisions 10-12). Modeled on
+    `cmd_state`: direct STATE calls, no subprocess. `corpus` joins NEITHER
+    `mutating_commands` (below) NOR the parity-pinned
+    `LEARN_MUTATING_SUBCOMMANDS` mirror — the `baseline` action takes the
+    shared activity lock ITSELF, here, so read-only `drift` never blocks
+    behind it and `state apply`'s name-match census is never falsely
+    tripped by a drift run."""
+    root = _resolve_cwd_toplevel(args.cwd)
+    head = _git_head(root)
+    try:
+        identity = STATE.project_identity(root)
+    except STATE.IdentityResolutionError as exc:
+        print(f"error: cannot resolve project identity for {root}: {exc}", file=sys.stderr)
+        return 1
+    if args.action == "baseline":
+        try:
+            location = STATE.resolve_project_corpus_strict(root)
+        except (
+            ValueError,
+            OSError,
+            STATE.CorpusResolutionError,
+            STATE.IdentityResolutionError,
+        ) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if location is not None and location.mode == "external":
+            print(
+                "external corpus baseline is unavailable; use `learn corpus drift --cwd ...` to inspect, "
+                "then choose `learn corpus publish`, `learn corpus import`, or `learn corpus unpublish`",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            # The activity lock spans state_paths re-resolution, the identity
+            # publish, AND the baseline write (council review): publishing
+            # `projects/<key>/` outside the lock lets a concurrent
+            # `state apply` transition generations between the publish and
+            # the write, leaving the baseline in a generation whose catalog
+            # never saw the identity record.
+            with STATE.activity_lock():
+                paths = STATE.state_paths()
+                if paths.active:
+                    key = STATE.ensure_project_record(paths.root, root, identity=identity)
+                else:
+                    key = identity.key
+                record = STATE.write_corpus_baseline(
+                    root, canonical=identity.canonical, key=key, head=head
+                )
+        except (ValueError, TimeoutError, OSError, STATE.IdentityResolutionError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"baseline written: {len(record['files'])} file(s), head={record['head'] or '(none)'}")
+        for name in sorted(record["files"]):
+            print(f"  {name}  {record['files'][name]}")
+        return 0
+    # drift: read-only, no activity lock. The key resolution sits INSIDE the
+    # try (council fix-round 3): resolve_or_derive_key scans every published
+    # project record, so a corrupt catalog entry raises
+    # IdentityResolutionError — the same failure the baseline branch already
+    # maps to rc 1.
+    try:
+        location = STATE.resolve_project_corpus_strict(root)
+        if location is not None and location.mode == "external":
+            return _render_corpus_sync_snapshot(
+                STATE.inspect_corpus_synchronization(root)
+            )
+        paths = STATE.state_paths()
+        key = STATE.resolve_or_derive_key(paths.root, root, identity=identity)
+        drift = STATE.compute_corpus_drift(root, key, head)
+    except STATE.CorpusBaselineAbsent:
+        print(
+            "no baseline recorded for this project; run "
+            "`learn corpus baseline --cwd ...` first",
+            file=sys.stderr,
+        )
+        return 2
+    except (
+        ValueError,
+        TimeoutError,
+        OSError,
+        STATE.IdentityResolutionError,
+        STATE.CorpusResolutionError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"head: {drift['head'] or '(none)'}  "
+        f"baseline-head: {drift['baseline_head'] or '(none)'}"
+    )
+    for name in drift["added"]:
+        print(f"added:   {name}")
+    for name in drift["removed"]:
+        print(f"removed: {name}")
+    for name in drift["changed"]:
+        print(f"changed: {name}")
+    print(f"unchanged: {drift['unchanged']}")
+    return 3 if (drift["added"] or drift["removed"] or drift["changed"]) else 0
+
+
+def cmd_corpus_status(args: argparse.Namespace) -> int:
+    """Report corpus authority without resolving or mutating a checkout."""
+    try:
+        if args.all:
+            rows = STATE.inspect_active_corpus_authority()
+        elif args.project_key:
+            rows = (STATE.inspect_project_corpus_status(project_key=args.project_key),)
+        else:
+            root = _resolve_cwd_toplevel(args.cwd)
+            rows = (STATE.inspect_project_corpus_status(project_root=root),)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for row in rows:
+        key = row.get("project_key") or "(checkout)"
+        reason = row.get("reason") or ""
+        print(f"{key}: {row['status']}" + (f" — {reason}" if reason else ""))
+    statuses = {row["status"] for row in rows}
+    if statuses & {"malformed", "dangling"}:
+        return 1
+    if statuses & {"pending-stale", "absent"}:
+        return 2
+    return 0
+
+
+def _render_corpus_synchronization_plan(plan: object) -> None:
+    print(f"project root: {plan.project_root}")
+    print(f"synchronization: {plan.state}")
+    print("target files:")
+    target_files = (
+        plan.recovery_target_files or plan.corpus_files
+        if plan.operation == "publish"
+        else ()
+    )
+    if target_files:
+        for name, digest in target_files:
+            print(f"  {name}  {digest}")
+    else:
+        print("  (none)")
+    print("modified-owned:")
+    for name in plan.modified_owned:
+        print(f"  {name}")
+    print("obsolete-owned:")
+    for name in plan.obsolete_owned:
+        print(f"  {name}")
+    print("foreign/unowned:")
+    for name in plan.foreign_unowned:
+        print(f"  {name}")
+    if plan.state == "sync-recovery-pending":
+        pending_operation = plan.pending_operation or plan.operation
+        print(
+            f"recovery: recover pending {pending_operation} with the same "
+            f"`learn corpus {pending_operation} --apply --yes` operation",
+            file=sys.stderr,
+        )
+        if pending_operation == "publish":
+            print(
+                "recovery: a blocked publish may be explicitly superseded with "
+                "`--replace-repository`",
+                file=sys.stderr,
+            )
+
+
+def _cmd_corpus_synchronization(args: argparse.Namespace, *, operation: str) -> int:
+    if args.apply != args.yes:
+        print(
+            f"corpus {operation} requires --apply --yes; nothing was written",
+            file=sys.stderr,
+        )
+        return 2
+    if args.replace_external:
+        print(
+            f"corpus {operation} accepts --replace-repository, not --replace-external",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        root = Path(args.cwd).absolute()
+        planner = (
+            STATE.plan_corpus_publish
+            if operation == "publish"
+            else STATE.plan_corpus_unpublish
+        )
+        plan = planner(root, replace_repository=args.replace_repository)
+    except (
+        ValueError,
+        OSError,
+        STATE.CorpusResolutionError,
+        STATE.IdentityResolutionError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    _render_corpus_synchronization_plan(plan)
+    if plan.blockers:
+        for blocker in plan.blockers:
+            print(f"blocked: {blocker}", file=sys.stderr)
+        return 2
+    if not args.apply:
+        print(f"read-only {operation} plan: nothing was written")
+        # A side-specific replacement flag authorizes preview of these two
+        # dirty states; every other state keeps the frozen policy-matrix rc.
+        if plan.replace_repository and plan.state in {"repository-only", "both"}:
+            return 0
+        return STATE.CORPUS_SYNC_POLICY[plan.state][1]
+    try:
+        result = (
+            STATE.apply_corpus_publish(plan)
+            if operation == "publish"
+            else STATE.apply_corpus_unpublish(plan)
+        )
+    except STATE._ProjectCorpusTransitionBlocked as exc:
+        for blocker in exc.blockers:
+            print(f"blocked: {blocker}", file=sys.stderr)
+        return 2
+    except (
+        ValueError,
+        OSError,
+        STATE.CorpusResolutionError,
+        STATE.IdentityResolutionError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(
+            "recovery: inspect `learn corpus status` and retry the same operation "
+            "if synchronization recovery is pending",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{operation} complete: {result.state}")
+    return 0
+
+
+def cmd_corpus_publish(args: argparse.Namespace) -> int:
+    return _cmd_corpus_synchronization(args, operation="publish")
+
+
+def cmd_corpus_unpublish(args: argparse.Namespace) -> int:
+    return _cmd_corpus_synchronization(args, operation="unpublish")
+
+
+def cmd_corpus_retire(args: argparse.Namespace) -> int:
+    """Archive lifecycle artifacts and remove only roster-bound untracked files."""
+    if args.write_roster and not args.manifest:
+        print("error: --write-roster requires --manifest", file=sys.stderr)
+        return 2
+    if args.manifest and (args.roster or args.deletion_index):
+        print("error: --manifest cannot be combined with --roster/--deletion-index", file=sys.stderr)
+        return 2
+    if args.deletion_index and (args.apply or args.restore or args.finalize):
+        print("error: --deletion-index is a read-only planning action", file=sys.stderr)
+        return 2
+    cwd = _resolve_cwd_toplevel(args.cwd) if args.cwd else Path.cwd().resolve()
+    script = _resolve_helper(cwd, "learnings-retire.sh")
+    if script is None:
+        print("error: learnings-retire.sh is not deployed", file=sys.stderr)
+        return 1
+    command = [str(script)]
+    if args.manifest:
+        command += ["--manifest", str(Path(args.manifest).resolve())]
+        if args.write_roster:
+            command += ["--write-roster", str(Path(args.write_roster).resolve())]
+    else:
+        command += ["--cwd", str(cwd)]
+        if args.roster:
+            command += ["--roster", str(Path(args.roster).resolve())]
+        if args.deletion_index:
+            command += ["--deletion-index", str(Path(args.deletion_index).resolve())]
+    if args.apply:
+        command.append("--apply")
+    if args.yes:
+        command.append("--yes")
+    if args.offline_maintenance:
+        command.append("--offline-maintenance")
+    if args.restore:
+        command.append("--restore")
+    if args.finalize:
+        command.append("--finalize")
+    return subprocess.run(command).returncode
+
+
+def cmd_corpus_import(args: argparse.Namespace) -> int:
+    """Render or apply the explicit legacy-cutover or external re-import plan."""
+    if args.apply and not (args.yes and args.offline_maintenance):
+        print(
+            "corpus import apply requires --apply --yes --offline-maintenance; "
+            "nothing was written",
+            file=sys.stderr,
+        )
+        return 2
+    roster_arg = getattr(args, "legacy_migration_roster", None)
+    if args.replace_external and roster_arg is not None:
+        print(
+            "--replace-external cannot be combined with --legacy-migration-roster; "
+            "nothing was written",
+            file=sys.stderr,
+        )
+        return 2
+    if args.replace_repository:
+        print("corpus import accepts --replace-external, not --replace-repository", file=sys.stderr)
+        return 2
+    migration_roster = None
+    if roster_arg is not None:
+        migration_roster = Path(roster_arg)
+        if not migration_roster.is_absolute():
+            print(
+                "--legacy-migration-roster requires an absolute path; nothing was written",
+                file=sys.stderr,
+            )
+            return 2
+    try:
+        root = _resolve_cwd_toplevel(args.cwd)
+        plan_kwargs = {"replace_external": args.replace_external}
+        if migration_roster is not None:
+            plan_kwargs["legacy_migration_roster"] = migration_roster
+        plan = STATE.plan_project_corpus_import(root, **plan_kwargs)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if migration_roster is not None and isinstance(plan, STATE.CorpusReimportPlan):
+        print(
+            "--legacy-migration-roster is only valid for a legacy cutover; "
+            "external re-import was not planned and nothing was written",
+            file=sys.stderr,
+        )
+        return 2
+    roster_accepted = (
+        migration_roster is not None
+        and getattr(plan, "legacy_migration_roster_accepted", False)
+    )
+    print(f"project root: {plan.project_root}")
+    print(f"identity: {plan.canonical_identity}")
+    print(f"identity key: {plan.identity_key}")
+    print(f"frozen project key: {plan.project_key}")
+    if isinstance(plan, STATE.CorpusReimportPlan):
+        print(f"synchronization: {plan.state}")
+        print(f"active revision: {plan.active_revision}")
+        print(f"frozen departing revision: {plan.frozen_revision}")
+        if plan.replace_external:
+            print("external loss: the current active external revision will be replaced")
+            for name in plan.external_loss:
+                print(f"  external loss: {name}")
+    else:
+        certification = " (roster-certified)" if roster_accepted else ""
+        print(f"system-owned primary: {plan.primary_status}{certification}")
+    if migration_roster is not None:
+        if not roster_accepted:
+            print("legacy migration roster: rejected; see blockers")
+        else:
+            print("legacy migration roster:")
+            print(
+                "  path: "
+                f"{plan.legacy_migration_roster_path or migration_roster}"
+            )
+            print(f"  sha256: {plan.legacy_migration_roster_sha256}")
+            print(f"  row sha256: {plan.legacy_migration_row_sha256}")
+            archives = plan.retained_archives
+            print("  retained archives:")
+            if archives:
+                for archive in archives:
+                    print(
+                        f"    {archive.name}  sha256={archive.sha256} "
+                        f"size={archive.size_bytes}"
+                    )
+            else:
+                print("    (none)")
+            print(
+                "  audit: "
+                f"{STATE.corpus_legacy_migration_audit_path(plan.project_key, plan.project_root)}"
+            )
+    print("source files:")
+    if plan.source_files:
+        for source in plan.source_files:
+            print(f"  {source.name}  sha256={source.sha256}  size={source.size_bytes}")
+    else:
+        print("  (none)")
+    print(f"lesson multiset: count={plan.lesson_count} sha256={plan.lesson_multiset_digest}")
+    print(f"target corpus: revision={plan.target_revision} sha256={plan.target_digest}")
+    print("worktree roots:")
+    for worktree, lock_path in zip(plan.worktree_roots, plan.structural_lock_paths, strict=True):
+        print(f"  {worktree}  legacy-lock={lock_path}")
+    if not plan.worktree_roots:
+        print("  (unavailable)")
+    print("independent clones:")
+    if plan.independent_clone_roots:
+        for clone_root in plan.independent_clone_roots:
+            print(f"  {clone_root}  identity evidence only; not locked or synchronized")
+    else:
+        print("  none known")
+    print(f"identity lock: {plan.identity_lock_path}")
+    print(f"projection: id={plan.projection_id} path={plan.projection_path}")
+    revision = "(none)" if plan.deployment_revision is None else str(plan.deployment_revision)
+    print(f"deployment: {plan.deployment_status} compatibility-revision={revision}")
+    print("blockers:")
+    if plan.blockers:
+        for blocker in plan.blockers:
+            print(f"  {blocker}")
+    else:
+        print("  none")
+    print("notes:")
+    if plan.notes:
+        for note in plan.notes:
+            print(f"  {note}")
+    else:
+        print("  none")
+    if not args.apply:
+        print("read-only plan: nothing was written")
+        return 2 if plan.blockers else 0
+    try:
+        outcome = STATE.apply_project_corpus_import(plan)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if outcome.revision:
+        print(f"active revision: {outcome.revision}")
+    for note in outcome.notes:
+        print(f"note: {note}")
+    if outcome.blockers:
+        for blocker in outcome.blockers:
+            print(f"blocked: {blocker}", file=sys.stderr)
+        return 2
+    print(f"corpus import {outcome.status}: {outcome.revision}")
+    return 0
+
+
+def cmd_corpus_init(args: argparse.Namespace) -> int:
+    """Render or perform explicit fresh project-corpus initialization."""
+    if args.offline_maintenance:
+        print("corpus init does not accept --offline-maintenance", file=sys.stderr)
+        return 2
+    if args.apply and not args.yes:
+        print("corpus init apply requires --apply --yes; nothing was written", file=sys.stderr)
+        return 2
+    try:
+        root = _resolve_cwd_toplevel(args.cwd)
+        plan = STATE.plan_project_corpus_init(root)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"project root: {plan.project_root}")
+    print(f"identity: {plan.canonical_identity}")
+    print(f"project key: {plan.project_key}")
+    print(f"template sha256: {plan.target_digest}")
+    print(f"target corpus: revision={plan.target_revision}")
+    print("repository mutation: none")
+    revision = "(none)" if plan.deployment_revision is None else str(plan.deployment_revision)
+    print(f"deployment: {plan.deployment_status} compatibility-revision={revision}")
+    print("blockers:")
+    if plan.blockers:
+        for blocker in plan.blockers:
+            print(f"  {blocker}")
+    else:
+        print("  none")
+    for note in plan.notes:
+        print(f"note: {note}")
+    if not args.apply:
+        print("read-only plan: nothing was written")
+        return 2 if plan.blockers else 0
+    try:
+        outcome = STATE.apply_project_corpus_init(plan)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if outcome.blockers:
+        for blocker in outcome.blockers:
+            print(f"blocked: {blocker}", file=sys.stderr)
+        return 2
+    print(f"corpus init {outcome.status}: {outcome.revision}")
+    return 0
+
+
+def cmd_corpus_relink(args: argparse.Namespace) -> int:
+    """Render or perform an explicit orphaned-checkout corpus relink."""
+    if args.apply and not args.yes:
+        print("corpus relink apply requires --apply --yes; nothing was written", file=sys.stderr)
+        return 2
+    try:
+        root = _resolve_cwd_toplevel(args.cwd)
+        plan = STATE.plan_corpus_relink(root, args.project_key)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"project root: {plan.project_root}")
+    print(f"identity: {plan.canonical_identity or '(unresolved)'}")
+    print(f"project key: {plan.project_key}")
+    print(f"active revision: {plan.active_revision or '(none)'}")
+    print("blockers:")
+    if plan.blockers:
+        for blocker in plan.blockers:
+            print(f"  {blocker}")
+    else:
+        print("  none")
+    for note in plan.notes:
+        print(f"note: {note}")
+    if not args.apply or plan.blockers:
+        print("read-only plan: nothing was written")
+        return 2 if plan.blockers else 0
+    try:
+        outcome = STATE.apply_corpus_relink(plan)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if outcome.blockers:
+        for blocker in outcome.blockers:
+            print(f"blocked: {blocker}", file=sys.stderr)
+        return 2
+    print(f"corpus relink {outcome.status}: {outcome.revision}")
+    return 0
+
+
+def cmd_corpus_rollback(args: argparse.Namespace) -> int:
+    """Render or apply one guarded project corpus rollback."""
+    if args.apply and not (args.yes and args.offline_maintenance):
+        print(
+            "corpus rollback apply requires --apply --yes --offline-maintenance; nothing was written",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        root = _resolve_cwd_toplevel(args.cwd)
+        plan = STATE.plan_project_corpus_rollback(root)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"project root: {plan.project_root}")
+    print(f"project key: {plan.project_key}")
+    print(f"active revision: {plan.active_revision or '(none)'}")
+    if plan.previous_revision:
+        print(f"frozen rollback target: {plan.previous_revision}")
+    else:
+        print(f"projection: {plan.projection_path} revision={plan.projection_revision or '(missing)'}")
+    print("blockers:")
+    if plan.blockers:
+        for blocker in plan.blockers:
+            print(f"  {blocker}")
+    else:
+        print("  none")
+    if not args.apply:
+        print("read-only plan: nothing was written")
+        return 2 if plan.blockers else 0
+    try:
+        outcome = STATE.apply_project_corpus_rollback(plan)
+    except (ValueError, OSError, STATE.IdentityResolutionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for note in outcome.notes:
+        print(f"note: {note}")
+    if outcome.blockers:
+        for blocker in outcome.blockers:
+            print(f"blocked: {blocker}", file=sys.stderr)
+        return 2
+    if outcome.status == "legacy-rolled-back":
+        print("legacy rollback complete: active authority preserved as deactivated.json")
+    elif outcome.status == "already-rolled-back":
+        print("legacy rollback already complete: deactivated authority remains preserved")
+    else:
+        print(f"external rollback complete: active revision {outcome.revision}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="learn",
+        description="learnings-system CLI",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_status = sub.add_parser(
+        "status",
+        help="show file sizes, section counts for the current project",
+    )
+    p_status.add_argument(
+        "--cwd",
+        default=None,
+        help="project directory to inspect (default: current dir)",
+    )
+    p_status.set_defaults(func=cmd_status)
+
+    p_metrics = sub.add_parser(
+        "metrics",
+        help="F2 v1: corpus health summary (entries, ref-counts)",
+    )
+    p_metrics.add_argument(
+        "--cwd",
+        default=None,
+        help="project directory to inspect (default: current dir)",
+    )
+    p_metrics.set_defaults(func=cmd_metrics)
+
+    p_stats = sub.add_parser(
+        "stats",
+        help="Stage 1 §4: entries, recent entries, searches, repeats",
+    )
+    p_stats.add_argument(
+        "--cwd",
+        default=None,
+        help="project directory to inspect (default: current dir)",
+    )
+    p_stats.set_defaults(func=cmd_stats)
+
+    p_search = sub.add_parser(
+        "search",
+        help="keyword search across project and global LEARNINGS files",
+    )
+    p_search.add_argument("query", help="search term (case-insensitive)")
+    p_search.add_argument(
+        "--scope",
+        choices=("project", "global", "all"),
+        default="project",
+        help="scope to search (project corpus, global pool, or both)",
+    )
+    p_search.add_argument(
+        "--cwd",
+        default=None,
+        help="project directory for project/all scope (default: current dir; ignored for global scope)",
+    )
+    p_search.set_defaults(func=cmd_search)
+
+    p_add = sub.add_parser(
+        "add",
+        help="append an entry under <section> in LEARNINGS-{topic}.md "
+        "(or LEARNINGS.md if no subfile yet)",
+    )
+    p_add.add_argument("topic", help="topic slug (e.g. 'locking')")
+    p_add.add_argument("section", help="section header text without leading '## '")
+    p_add.add_argument("entry", help="bullet text (no leading dash)")
+    p_add.add_argument(
+        "--cwd",
+        default=None,
+        help="project directory (default: current dir)",
+    )
+    p_add.set_defaults(func=cmd_add)
+
+    p_deploy = sub.add_parser(
+        "deploy",
+        help="run bin/deploy.sh (only available from canonical-source repo)",
+    )
+    p_deploy.set_defaults(func=cmd_deploy)
+
+    p_migrate_ids = sub.add_parser(
+        "migrate-ids",
+        help="backfill stable entry ids onto corpus bullets that lack one "
+        "(mechanical, idempotent, no LLM)",
+    )
+    p_migrate_ids.add_argument(
+        "--cwd",
+        default=None,
+        help="project directory (default: current dir)",
+    )
+    p_migrate_ids.set_defaults(func=cmd_migrate_ids)
+
+    p_state = sub.add_parser(
+        "state",
+        help="provider-neutral state: activation status, legacy import plan, "
+        "and the Part 3C transitions (import --apply / rollback / reactivate)",
+    )
+    p_state.add_argument(
+        "action",
+        choices=("status", "import", "rollback", "reactivate", "archive-records"),
+        help="status: activation record + light legacy-drift check; "
+        "import: render the read-only ImportPlan (blockers included) — "
+        "add --apply --yes --offline-maintenance to stage, publish, and "
+        "activate a neutral generation; rollback: deactivate (one atomic "
+        "replace; both trees preserved); reactivate: restore the preserved "
+        "generation after full digest re-verification; archive-records: "
+        "move dead catalog records (temp pytest-scratch registrations, "
+        "ghosts with no live observed root) from projects/ into "
+        "archive/projects/ — dry-run report by default, add --apply --yes "
+        "to move",
+    )
+    p_state.add_argument(
+        "--apply",
+        action="store_true",
+        help="with import: perform the activation transition (requires "
+        "--yes AND --offline-maintenance; refuses while a neutral "
+        "generation is already active); with archive-records: move the "
+        "candidates (requires --yes)",
+    )
+    p_state.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirmation gate for --apply, rollback, and reactivate",
+    )
+    p_state.add_argument(
+        "--key",
+        action="append",
+        metavar="KEY",
+        default=None,
+        help="with archive-records: restrict to exactly these catalog keys "
+        "and allow archiving a `live` (existing observed root) record; "
+        "never overrides a `has-corpus` refusal. Repeatable.",
+    )
+    p_state.add_argument(
+        "--neutral-root",
+        default=None,
+        metavar="PATH",
+        help="with archive-records: use PATH/projects, PATH/corpora, and "
+        "PATH/archive directly instead of the resolved state root "
+        "(test/override use only)",
+    )
+    p_state.add_argument(
+        "--abandon-external",
+        action="store_true",
+        help=(
+            "with rollback: preserve raw project active records as deactivated "
+            "evidence before machine rollback"
+        ),
+    )
+    p_state.add_argument(
+        "--offline-maintenance",
+        action="store_true",
+        help="with --apply: confirms every Claude/Codex session is closed "
+        "and detached learnings workers are stopped (a confirmation gate, "
+        "not synchronization — the census and lock probes still run)",
+    )
+    p_state.add_argument(
+        "--mode-only",
+        action="store_true",
+        help="with status: print exactly `neutral` or `legacy` (one token, "
+        "rc 0) — the machine-readable probe deploy.sh runs (decision 12)",
+    )
+    p_state.add_argument(
+        "--prefer-portable",
+        action="append",
+        metavar="LEGACY_ALIAS",
+        default=None,
+        help="repeatable: select one portable alias per conflicted project "
+        "(bare slug or full *-PORTABLE-LEARNINGS.md filename)",
+    )
+    p_state.set_defaults(func=cmd_state)
+
+    p_corpus = sub.add_parser(
+        "corpus",
+        help="Part 7A: per-file corpus baseline + drift (decisions 10-12)",
+    )
+    corpus_actions = p_corpus.add_subparsers(dest="action", required=True)
+    for action, help_text in (
+        ("baseline", "hash and record repository corpus files"),
+        ("drift", "compare repository corpus files to the stored baseline"),
+    ):
+        corpus_parser = corpus_actions.add_parser(action, help=help_text)
+        corpus_parser.add_argument(
+            "--cwd", default=None,
+            help="project directory (default: current dir; resolved to the git toplevel)",
+        )
+        corpus_parser.set_defaults(func=cmd_corpus)
+    p_status = corpus_actions.add_parser("status", help="inspect project corpus authority")
+    selectors = p_status.add_mutually_exclusive_group(required=True)
+    selectors.add_argument("--cwd", help="checkout to inspect")
+    selectors.add_argument("--project-key", help="authority key, independent of checkout")
+    selectors.add_argument("--all", action="store_true", help="enumerate every authority entry")
+    p_status.set_defaults(func=cmd_corpus_status)
+    for action, handler, description in (
+        ("publish", cmd_corpus_publish, "report or publish external corpus into the checkout"),
+        ("unpublish", cmd_corpus_unpublish, "report or remove owned checkout corpus files without Git operations"),
+    ):
+        sync_parser = corpus_actions.add_parser(action, help=description)
+        sync_parser.add_argument("--cwd", required=True, help="external project checkout")
+        sync_parser.add_argument("--apply", action="store_true", help=f"apply the reviewed {action} plan")
+        sync_parser.add_argument("--yes", action="store_true", help=f"confirm the reviewed {action} plan")
+        sync_parser.add_argument(
+            "--replace-repository",
+            action="store_true",
+            help=(
+                "authorize overwriting or removing exactly the listed modified "
+                "projection-owned files; foreign files still block"
+            ),
+        )
+        sync_parser.add_argument("--replace-external", action="store_true", help=argparse.SUPPRESS)
+        sync_parser.set_defaults(func=handler)
+    p_import = corpus_actions.add_parser(
+        "import",
+        help=(
+            "report a read-only plan to import primary/topic corpus files; "
+            "the safe path-derived portable is retained as a note"
+        ),
+    )
+    p_import.add_argument(
+        "--cwd",
+        required=True,
+        help="existing legacy project directory; subdirectories resolve to its Git root",
+    )
+    p_import.add_argument("--apply", action="store_true", help="perform the guarded cutover")
+    p_import.add_argument("--yes", action="store_true", help="confirm the guarded cutover")
+    p_import.add_argument(
+        "--offline-maintenance",
+        action="store_true",
+        help="confirm every legacy worker is stopped before the guarded cutover",
+    )
+    p_import.add_argument(
+        "--replace-external",
+        action="store_true",
+        help="authorize discarding the current external revision for external-only or both drift",
+    )
+    p_import.add_argument(
+        "--legacy-migration-roster",
+        metavar="ABSOLUTE_PATH",
+        help=(
+            "use the reviewed, exact-match legacy migration roster for one "
+            "historic corpus; valid only for a first legacy cutover"
+        ),
+    )
+    p_import.add_argument("--replace-repository", action="store_true", help=argparse.SUPPRESS)
+    p_import.set_defaults(func=cmd_corpus_import)
+    p_init = corpus_actions.add_parser(
+        "init",
+        help=(
+            "report or initialize a fresh external corpus; any repository "
+            "corpus artifact, including a portable snapshot, blocks"
+        ),
+    )
+    p_init.add_argument("--cwd", required=True, help="fresh project directory; subdirectories resolve to its Git root")
+    p_init.add_argument("--apply", action="store_true", help="perform the explicit initialization")
+    p_init.add_argument("--yes", action="store_true", help="confirm explicit initialization")
+    p_init.add_argument(
+        "--offline-maintenance", action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_init.set_defaults(func=cmd_corpus_init)
+    p_relink = corpus_actions.add_parser(
+        "relink",
+        help=(
+            "report or repair a checkout whose folder AND remote both changed, "
+            "relinking it to its orphaned external corpus record"
+        ),
+    )
+    p_relink.add_argument(
+        "--cwd", required=True, help="checkout to relink; subdirectories resolve to its Git root"
+    )
+    p_relink.add_argument("--project-key", required=True, help="the orphaned corpus's authority key")
+    p_relink.add_argument("--apply", action="store_true", help="perform the guarded relink")
+    p_relink.add_argument("--yes", action="store_true", help="confirm the guarded relink")
+    p_relink.set_defaults(func=cmd_corpus_relink)
+    p_rollback = corpus_actions.add_parser(
+        "rollback",
+        help="report or perform a guarded rollback of one external project corpus",
+    )
+    p_rollback.add_argument("--cwd", required=True, help="project checkout to roll back")
+    p_rollback.add_argument("--apply", action="store_true", help="perform the guarded rollback")
+    p_rollback.add_argument("--yes", action="store_true", help="confirm the guarded rollback")
+    p_rollback.add_argument(
+        "--offline-maintenance", action="store_true",
+        help="confirm every legacy worker is stopped before the guarded rollback",
+    )
+    p_rollback.set_defaults(func=cmd_corpus_rollback)
+    p_retire = corpus_actions.add_parser(
+        "retire",
+        help="archive repository lifecycle artifacts and remove only untracked generated copies",
+    )
+    retire_target = p_retire.add_mutually_exclusive_group(required=True)
+    retire_target.add_argument("--cwd", help="external project checkout")
+    retire_target.add_argument("--manifest", help="existing migration manifest to derive the fleet roster")
+    p_retire.add_argument("--write-roster", help="write the derived canonical fleet roster")
+    p_retire.add_argument("--roster", help="canonical retirement roster binding this checkout")
+    p_retire.add_argument(
+        "--deletion-index",
+        help="build and report the roster-bound deletion tree through this temporary Git index",
+    )
+    p_retire.add_argument(
+        "--apply",
+        action="store_true",
+        help="archive and remove roster-bound untracked artifacts",
+    )
+    p_retire.add_argument("--yes", action="store_true", help="confirm the reviewed retirement plan")
+    p_retire.add_argument(
+        "--offline-maintenance",
+        action="store_true",
+        help="confirm Claude/Codex sessions and detached workers are stopped",
+    )
+    p_retire.add_argument("--restore", action="store_true", help="restore archived untracked artifacts")
+    p_retire.add_argument(
+        "--finalize", action="store_true", help="verify Git removed every roster artifact and complete the audit"
+    )
+    p_retire.set_defaults(func=cmd_corpus_retire)
+
+    p_cleanup = sub.add_parser(
+        "cleanup",
+        help="F4-B: delete stale transient artifacts (markers, locks, "
+        "consolidation reports) older than --days. Dry-run by default.",
+    )
+    p_cleanup.add_argument(
+        "--cwd",
+        default=None,
+        help="project directory (default: current dir)",
+    )
+    p_cleanup.add_argument(
+        "--transcript-dir",
+        default=None,
+        help="override transcript dir (default: derived from cwd)",
+    )
+    p_cleanup.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="age threshold in days (default: 30)",
+    )
+    p_cleanup.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually delete (default: dry-run). Requires --yes on non-TTY.",
+    )
+    p_cleanup.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm --apply without a TTY prompt.",
+    )
+    p_cleanup.set_defaults(func=cmd_cleanup)
+
+    return parser
+
+
+# `learn state` transition verbs that always write the state store;
+# `import` and `archive-records` write only with --apply (dry-run otherwise),
+# and status is a read.
+_STATE_TRANSITION_ACTIONS = frozenset({"rollback", "reactivate"})
+_STATE_APPLY_GATED_ACTIONS = frozenset({"import", "archive-records"})
+
+
+def _mutating_invocation(args: argparse.Namespace) -> str | None:
+    """Name the invocation when it writes a corpus or the state store, else
+    None. Classified by the shared `STATE.LEARN_MUTATING_SUBCOMMANDS` set
+    (never a second list) plus the mutating `corpus` and `state` actions,
+    which hide under a shared top-level verb. `bin/learn`'s own
+    `mutating_commands` set below decides activity-lock wrapping only."""
+    action = getattr(args, "action", None)
+    if args.command in STATE.LEARN_MUTATING_SUBCOMMANDS:
+        return args.command
+    if args.command == "corpus" and (action in STATE.LEARN_CORPUS_MUTATING_ACTIONS or action == "baseline"):
+        return f"corpus {action}"
+    if args.command == "state" and (
+        action in _STATE_TRANSITION_ACTIONS
+        or (action in _STATE_APPLY_GATED_ACTIONS and getattr(args, "apply", False))
+    ):
+        return f"state {action}"
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # Harness sessions never write: refuse BEFORE any lock or corpus
+    # resolution. STATE.corpus_write_session refuses again at the storage
+    # seam, so a writer this classifier misses still cannot land.
+    if STATE.session_class() == "harness":
+        refused = _mutating_invocation(args)
+        if refused is not None:
+            sys.stderr.write(f"learn: refusing {refused!r}: LEARNINGS_SESSION_CLASS=harness\n")
+            return 2
+    mutating_commands = {"cleanup"}
+    if args.command in mutating_commands:
+        with STATE.activity_lock():
+            return args.func(args)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        try:
+            exit_code = main()
+        except SystemExit as exc:
+            # argparse exits for --help; its buffered output also needs a flush.
+            exit_code = exc.code
+        if sys.stdout is not None:
+            sys.stdout.flush()
+    except BrokenPipeError:
+        # Prevent Python's shutdown flush from reporting the same closed pipe.
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), sys.stdout.fileno())
+        exit_code = 1
+    sys.exit(exit_code)

@@ -1,0 +1,31 @@
+{
+  "description": "Inject shared LEARNINGS context and the preflight advisory.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "export PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}\"; adapter=\"$PLUGIN_ROOT/scripts/codex-learnings-hook.py\"; if [ -n \"$PLUGIN_ROOT\" ] && [ -x \"$adapter\" ]; then exec \"$adapter\"; fi; exec \"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/adapters/codex/codex-learnings-hook.py\"",
+            "timeout": 120,
+            "statusMessage": "Preparing shared learnings",
+            "additionalContextLimit": 6000
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "export PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}\"; [ ! -f \"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/hooks/preflight-gate.py\" ] || UV_CACHE_DIR=\"${XDG_CACHE_HOME:-$HOME/.cache}/learnings-md-system/uv-cache\" uv run --no-project --offline --python '>=3.11' python \"${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/hooks/preflight-gate.py\" || true; cat >/dev/null",
+            "timeout": 10,
+            "additionalContextLimit": 2500
+          }
+        ]
+      }
+    ]
+  }
+}

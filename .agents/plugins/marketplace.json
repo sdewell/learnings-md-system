@@ -1,0 +1,20 @@
+{
+  "name": "learnings-md-system",
+  "interface": {
+    "displayName": "Learnings Md System"
+  },
+  "plugins": [
+    {
+      "name": "learnings-md-system-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/learnings-md-system-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

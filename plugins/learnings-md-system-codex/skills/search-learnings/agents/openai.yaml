@@ -1,0 +1,4 @@
+interface:
+  display_name: "Search Learnings"
+  short_description: "Search the shared project LEARNINGS corpus"
+  default_prompt: "Use $search-learnings to find relevant prior project lessons."

@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "preamble": "Before committing or shipping non-trivial code, check it against these recurring root-cause classes (distilled from cross-project review history). Each is a question to ask of the diff, not a style rule. When a fix lands in one of these classes, tag the commit `Class: <slug>` (the review-fix commit convention).",
+  "classes": [
+    {
+      "slug": "shared-dir-io",
+      "question": "Multiple processes/sessions read+write the same dir or file (a sandbox HOME, a SQLite db, LEARNINGS subfiles). Is concurrent access coordinated (flock / atomic temp-then-rename / append), and does a partial or stale read fail loudly instead of silently?"
+    },
+    {
+      "slug": "enumerate-writers",
+      "question": "Before changing OR REMOVING a shared artifact — a marker, a config key, an on-disk schema, a parsed contract, a CLI command — enumerate EVERY producer and consumer, not just the one in front of you. Search past this repo's boundary: skills, agent briefs, runbooks and hook registrations call your code and never appear in your diff. Docs that restate a default you are changing count too."
+    },
+    {
+      "slug": "marker-semantics",
+      "question": "Sentinel/marker/status files and flags: get the full lifecycle right — creation, detection, clearing, and the stale-marker race. What happens if the marker is left over from a prior run, or never written?"
+    },
+    {
+      "slug": "llm-output-contract",
+      "question": "Never assume an agent/LLM returns well-formed output. Handle empty, whitespace-only, malformed, truncated, and wrong-schema responses explicitly at the boundary."
+    },
+    {
+      "slug": "units-and-path-anchoring",
+      "question": "Mismatched units (seconds vs ms, UTC vs local time) and unanchored matches (relative vs absolute paths, un-anchored regex or ID matching). Make units explicit and convert at the boundary; anchor paths and patterns."
+    },
+    {
+      "slug": "cache-invalidation",
+      "question": "A cached or derived artifact (an install, a build output, a sidecar): does its key include the version of the code that PRODUCED it, not just its input's identity? A key that omits the producer keeps serving the old answer after the code changes, and stale looks exactly like fresh."
+    },
+    {
+      "slug": "test-quality",
+      "question": "Does each touched test actually fail when the behaviour it names breaks? Watch for assertions that hold either way, and fixed sleeps standing in for a condition — those pass in isolation and flake under load. A test that passes for the wrong reason masks the regression it was meant to catch."
+    },
+    {
+      "slug": "unfired-detector",
+      "question": "Does every new detector, guard, or validation check in this change have a proven known positive (you watched it fire on input it must catch) and a known negative (it stayed quiet on clean input)? A clean pass from an unproven check is instrument failure, not evidence — and so is an alarm from one."
+    }
+  ]
+}
