@@ -187,11 +187,12 @@ and is not a controlled before-and-after comparison.
 | `learn add` run | 21 |
 
 Search did not disappear as expected. Whether repeat mistakes declined is
-still unresolved. The repeat detector uses three shared tokens, so it can
-name an unrelated entry. Usage-error false matches also inflated the counts
+still unresolved. At that reading, the repeat detector used three shared
+tokens, so it could name an unrelated entry. Usage-error false matches also inflated the counts
 until they were silenced. The five recorded skill loads show some engagement
 with the procedure; they do not count completed changes or prevented mistakes.
 
-The next reading will help decide whether to replace the repeat match. A
-`Recorded before` nudge that still names an unrelated entry is the signal
-to replace it rather than tune it.
+Two further unrelated matches were reproduced in November. The replacement
+requires a coherent diagnostic phrase and abstains on equally strong lessons.
+Those regressions establish the known cases are fixed, not general accuracy.
+The next reading must separate events from the old and new matchers.

@@ -65,6 +65,15 @@ If you discover something worth capturing during the work, use:
 "${LEARNINGS_CORE_HOME:-$HOME/.local/share/learnings-md-system}/bin/learn" add <topic-slug> "<section header>" "<entry text>"
 ```
 
-The CLI routes to the right file (existing topic subfile if present, else the monolithic `LEARNINGS.md`) and appends under a file lock, so concurrent sessions in the same project cannot interleave their writes.
+The CLI appends to an existing matching topic subfile. For an unknown topic, it creates a new subfile in INDEX mode and appends to `LEARNINGS.md` in monolith mode. Writes use the checked corpus write session and its locks, so concurrent sessions in the same project cannot interleave their writes.
+
+Creating a topic in INDEX mode also refreshes its catalog in the same write
+session. To refresh an existing catalog explicitly, run `learn index` for a
+preview, then `learn index --apply --yes` to write it, using the installed-core
+path above. Add `--cwd <project>` to select another project. This preserves
+existing metadata; it does not generate summaries or split a monolith.
+Unrecognized catalog prose or stale summary text blocks refresh. A new-topic
+add still saves the lesson, leaves the index unchanged, and warns about the
+stale catalog. Reconcile the catalog before retrying `learn index`.
 
 If the lesson is a repeat (the failure hook said `Recorded before`), load the `route-learning` skill instead of adding a second line.

@@ -47,7 +47,9 @@ First contact: fix it, then one archive line with
 
 Second contact is the failure hook printing `Recorded before: … [id]`, or a
 `learn search` hit that saved you. That is when this skill runs. Say in one
-line why the archive line was not applied, then route.
+line why the archive line was not applied, then route. First verify that the
+cited lesson applies: the failure hook supplies a lexical cue, not proof of
+the same root cause. An unrelated suggestion is not second contact.
 
 ## How to write each destination
 

@@ -41,7 +41,7 @@ only way an entry enters the archive is `learn add`.
 
 | Part | What it does |
 |---|---|
-| `bin/learn` | The CLI: `add`, `search`, `status`, `stats`, `cleanup`, and corpus management |
+| `bin/learn` | The CLI: `add`, `search`, `index`, `status`, `stats`, `cleanup`, and corpus management |
 | `hooks/learning-on-start.py` | SessionStart: orients the agent to the project's archive and injects shared gotchas |
 | `hooks/learning-on-failure.py` | PostToolUseFailure: the first-contact and `Recorded before` nudges |
 | `hooks/preflight-gate.py` | PreToolUse on `gh pr create`: an advisory checklist of recurring bug classes (below) |
@@ -52,6 +52,16 @@ only way an entry enters the archive is `learn add`.
 
 Claude Code and Codex are two hosts of one system. Each has a thin adapter
 that translates its lifecycle events into the shared core.
+
+In an indexed corpus, adding a new topic also refreshes the topic catalog.
+To rebuild that catalog explicitly, run `learn index` to preview the result
+and `learn index --apply --yes` to write it. Use `--cwd /path/to/project`
+to select another project. This preserves existing summary and keywords
+headers; it does not generate summaries or split a monolith.
+Sections outside the catalog are preserved. Unrecognized catalog prose or
+stale summary text must be reconciled before refresh can proceed.
+A new-topic add still saves the lesson in that case and warns that its
+catalog was left unchanged.
 
 ### The pre-flight gate
 
@@ -74,7 +84,7 @@ codebase.
 
 ## Install
 
-Requirements: macOS, `uv`, Python 3.12 or newer, and Git. Linux is not
+Requirements: macOS, `uv`, Python 3.11 or newer, and Git. Linux is not
 tested.
 
 ```bash
@@ -151,9 +161,13 @@ Add the core's `bin/` to your `PATH` if you want to type `learn` directly.
 
 - Single user, single machine. Concurrent sessions on one machine are
   handled with file locks; multiple users are not a goal.
-- The recurrence match is lexical: three shared tokens between a new failure
-  and an archived entry. It produces false matches. Whether to replace it is
-  the next open question (see the design story).
+- The recurrence match is a conservative lexical cue: a contiguous diagnostic
+  phrase must match an archived entry, and tied lessons cause abstention.
+  Complete standard Python tracebacks use the final exception; other output
+  uses its first non-empty line. Exception Groups and ambiguous traceback
+  formats are skipped.
+  It can still miss paraphrases or suggest a lesson with a different cause.
+  Verify the cited lesson applies before routing it (see the design story).
 - macOS only by test.
 
 ## License

@@ -72,6 +72,28 @@ def _load_state_module():
     return module
 
 
+def _load_index_module():
+    """Load the renderer from this writer's trusted sibling, never a project pin."""
+    path = Path(__file__).resolve().with_name("learnings-index.sh")
+    name = "learnings_index_renderer"
+    cached = sys.modules.get(name)
+    if cached is not None and Path(getattr(cached, "__file__", None) or "").resolve() == path:
+        return cached
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:
+        raise RuntimeError(f"cannot load index renderer: {path}")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    sys.modules[name] = module
+    return module
+
+
 LOCK_TIMEOUT_SECONDS = 5
 # Block for up to this long on the project-scoped structural lock (held by
 # bin/learnings-auto-split.sh during split orchestration). Auto-split no longer
@@ -583,9 +605,9 @@ def resolve_target(topic: str, learnings_dir: Path) -> Path:
 
 def _new_subfile_header(topic: str) -> str:
     """Standard skeleton for a freshly-created topic subfile. The
-    summary/keywords placeholders are filled in by
-    bin/learnings-summarize.sh on its next run; until then they are
-    empty strings — the index rebuilder treats them as 'pending'."""
+    summary/keywords placeholders stay empty until filled by hand (the
+    summarizer was deleted in the 2026-09-06 trim); the index rebuilder
+    treats them as 'pending'."""
     return (
         f"# {topic}\n"
         "\n"
@@ -723,6 +745,7 @@ def main() -> int:
     # accidental new topic used to report the same "appended to X" as a
     # correct write, which reads as success.
     created_new_topic = False
+    index_refresh_warning: str | None = None
 
     session_id = os.environ.get("LEARNINGS_SESSION_ID") or "unknown"
     timestamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%MZ")
@@ -789,7 +812,32 @@ def main() -> int:
                 content = _new_subfile_header(target.name[len("LEARNINGS-"):-len(".md")])
                 created_new_topic = not target_existed
             new_content = insert_entry(content, section, entry_line)
-            if snapshot is None:
+            if created_new_topic:
+                try:
+                    index_module = _load_index_module()
+                    if location.mode != "external":
+                        snapshots = tuple(
+                            session.read(path) for path in index_module._select_index_paths(state, location)
+                        )
+                    main_snapshot = next((item for item in snapshots if item.name == "LEARNINGS.md"), None)
+                    if main_snapshot is None:
+                        raise state.CorpusMutationError("LEARNINGS.md is missing")
+                    contents = {item.name: item.text for item in snapshots}
+                    contents[target.name] = new_content
+                    try:
+                        new_index, _topics, _children = index_module._checked_index(state, location, contents)
+                    except index_module.CatalogShapeError as exc:
+                        # Preserve capture availability for hand-maintained or
+                        # stale catalogs; never overwrite their uncertain text.
+                        new_index = main_snapshot.text
+                        index_refresh_warning = str(exc)
+                except Exception as exc:
+                    raise state.CorpusMutationError(f"cannot refresh topic index: {exc}") from exc
+                batch = state.CorpusMutationBatch(
+                    creations=((target.name, new_content),),
+                    authority_replacement=(main_snapshot, new_index),
+                )
+            elif snapshot is None:
                 batch = state.CorpusMutationBatch(creations=((target.name, new_content),))
             else:
                 batch = state.CorpusMutationBatch(replacements=((snapshot, new_content),))
@@ -811,6 +859,12 @@ def main() -> int:
         return 1
     finally:
         session.close()
+
+    if index_refresh_warning is not None:
+        sys.stderr.write(
+            f"warning: entry captured, but the topic index was not refreshed: {index_refresh_warning}. "
+            f"Reconcile the catalog and preview with 'learn index --cwd {project_root}'.\n"
+        )
 
     # In external mode learnings_dir is the central store, not a directory in
     # the checkout — name it so the caller doesn't go looking for target.name

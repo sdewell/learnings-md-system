@@ -59,10 +59,16 @@ def _installed_code_paths() -> tuple[str, str]:
     if (adapter_bin / "deploy.sh").is_file():
         home = Path(os.environ.get("HOME") or Path.home())
         core = Path(os.environ.get("LEARNINGS_CORE_HOME") or home / ".local" / "share" / "learnings-md-system")
-        if _state_seam_active() and (core / "bin").is_dir():
-            adapter_bin = core / "bin"
-        else:
-            adapter_bin = home / ".claude" / "bin"
+        core_bin = core / "bin"
+        legacy_bin = home / ".claude" / "bin"
+        # Installed code does not depend on which state generation is active.
+        # Resolve helpers and CLI separately so a partial installation cannot
+        # hide a working candidate in the other layout.
+        helpers = core_bin if (core_bin / "learnings-write.sh").is_file() else legacy_bin / "learnings"
+        cli = core_bin / "learn"
+        if not _is_our_learn(str(cli)):
+            cli = legacy_bin / "learn"
+        return str(helpers), str(cli)
     helpers = adapter_bin if (adapter_bin / "learnings-write.sh").is_file() else adapter_bin / "learnings"
     return str(helpers), str(adapter_bin / "learn")
 
@@ -122,7 +128,9 @@ _BIN_SCRIPTS_IN_MESSAGES = (
 )
 
 
-_LEARN_SUBCOMMANDS_RE = re.compile(r"\blearn (search|add|status|deploy)\b")
+_LEARN_SUBCOMMANDS_RE = re.compile(
+    r"\blearn (add|search|index|status|stats|state|metrics|deploy|cleanup|corpus|migrate-ids)\b"
+)
 
 
 _LEARN_OWNERSHIP_MARKER = "learnings-system CLI"

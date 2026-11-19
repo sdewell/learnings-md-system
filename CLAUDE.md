@@ -5,5 +5,6 @@
 
 Start with README.md; terms are in CONTEXT.md. This repository is a
 generated release: change the source, not this copy (CONTRIBUTING.md).
-Nothing calls a model; the only corpus writer is `learn add`. Deploy only
+Nothing calls a model; entries enter through `learn add`, and `learn index`
+refreshes catalog metadata. Deploy only
 through `bin/deploy.sh`.

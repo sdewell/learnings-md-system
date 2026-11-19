@@ -1127,7 +1127,8 @@ existing fits."""
 def _inject_resolved_paths(text: str, _cwd: str) -> str:
     """Keep host guidance usable when the shared CLI is not on PATH."""
     return re.sub(
-        r"\blearn (search|add|status|deploy)\b",
+        r"\blearn (add|search|index|status|stats|state|metrics|deploy|cleanup|"
+        r"corpus|migrate-ids)\b",
         lambda match: f"{_learn_cli_command()} {match.group(1)}",
         text,
     )

@@ -6,9 +6,9 @@ Quiet corpus Stage 1 §3: most failures the hook used to nag about are the
 caller's own expected non-zero exit (a `test` probe, `ls` checking for a
 path, an rtk artifact) — those are silenced by a fixed list of predicates,
 never a heuristic. A REAL failure gets a recurrence check: if the corpus
-already has an entry whose text overlaps enough with this failure's
-signature, the nudge points at that entry (and counts the repeat in
-`repeats.json`) instead of asking for a fresh one.
+already has an entry with a matching ordered diagnostic phrase, the nudge
+points at that entry (and counts the repeat in `repeats.json`) instead of
+asking for a fresh one.
 
 Main-agent-only: a payload carrying `agent_id` comes from a subagent (the same
 identity rule `learning-hook.py` uses). Parallel implementation workers each
@@ -280,6 +280,23 @@ def _is_silent_failure(tool_name: str, command: str, error: str) -> bool:
 _STOPWORDS = frozenset(
     {"the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "not", "with", "from", "this", "that", "file"}
 )
+# These describe failure in general, rather than the particular diagnostic.
+_DIAGNOSTIC_BOILERPLATE = frozenset(
+    {
+        "error",
+        "errors",
+        "warning",
+        "fatal",
+        "failed",
+        "failure",
+        "cannot",
+        "could",
+        "unable",
+        "exception",
+        "read",
+        "find",
+    }
+)
 _CORPUS_READ_CAP_BYTES = 1 << 20  # 1 MiB
 _ENTRY_ID_TAG_RE = re.compile(r"<!--\s*id:([0-9a-z]{6})(?:\s+@\S+\s+\S+)?\s*-->\s*$")
 # Full trailing-tag pattern (all shapes) — duplicated from
@@ -287,25 +304,95 @@ _ENTRY_ID_TAG_RE = re.compile(r"<!--\s*id:([0-9a-z]{6})(?:\s+@\S+\s+\S+)?\s*-->\
 _TAG_RE = re.compile(r"\s*<!--\s*(?:id:[0-9a-z]{6}(?:\s+@\S+\s+\S+)?|@\S+\s+\S+)\s*-->\s*$")
 
 
-def _signature_tokens(command: str, error: str) -> set[str]:
-    """Lowercased signature: the command's first two whitespace-separated
-    words (rtk-stripped) plus the words of the first non-empty error line
-    after `Exit code N`. Tokens under 4 chars, pure numbers, and a small
-    stopword set are dropped."""
-    parts = _command_parts(command)
-    if parts and parts[0] == "rtk":
-        parts = parts[1:]
-    words = list(parts[:2])
+def _normalized_terms(text: str) -> list[str]:
+    """Lowercase terms, keeping paths and dotted identifiers opaque."""
+    return re.findall(r"(?:[~./\\]+)?[\w-]+(?:[./\\][\w.-]*\w)*", text.lower())
+
+
+def _standard_traceback_diagnostic(lines: list[str]) -> str | None:
+    """Accept complete standard tracebacks, never an arbitrary later line.
+
+    Frame/source lines are structural evidence only. Notes, multiline messages,
+    exception groups and incomplete frames remain ambiguous and are skipped.
+    """
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    i = 0
+    while i < len(lines) and lines[i] == "Traceback (most recent call last):":
+        i += 1
+        frames = 0
+        while i < len(lines) and re.fullmatch(r'  File ".+", line [0-9]+(?:, in .+)?', lines[i]):
+            frames += 1
+            i += 1
+            while i < len(lines) and lines[i].startswith("    "):
+                i += 1
+            if i < len(lines) and re.fullmatch(r"  \[Previous line repeated [1-9][0-9]* more times?\]", lines[i]):
+                i += 1
+        if not frames or i >= len(lines) or not re.fullmatch(r"(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?::.*)?", lines[i]):
+            return None
+        diagnostic = lines[i]
+        i += 1
+        if i == len(lines):
+            return diagnostic
+        # Python renders a blank line on each side of either chain separator.
+        if i + 2 >= len(lines) or lines[i] or lines[i + 2]:
+            return None
+        if lines[i + 1] not in (
+            "During handling of the above exception, another exception occurred:",
+            "The above exception was the direct cause of the following exception:",
+        ):
+            return None
+        i += 3
+    return None
+
+
+def _diagnostic_terms(error: str) -> list[str]:
+    """First diagnostic or a complete standard traceback's final exception."""
     _exit_code, body = _parse_exit(error)
-    first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
-    words.extend(first_line.split())
-    tokens: set[str] = set()
-    for word in words:
-        token = word.lower()
-        if len(token) < 4 or token.isdigit() or token in _STOPWORDS:
-            continue
-        tokens.add(token)
-    return tokens
+    lines = body.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), len(lines))
+    lines = lines[first:]
+    first_line = lines[0] if lines else ""
+    if first_line == "Traceback (most recent call last):":
+        diagnostic = _standard_traceback_diagnostic(lines)
+        return _normalized_terms(diagnostic) if diagnostic is not None else []
+    # Decorated/exception-group headers do not identify a particular failure.
+    if first_line.rstrip().endswith("Traceback (most recent call last):"):
+        return []
+    return _normalized_terms(first_line)
+
+
+def _longest_diagnostic_span(diagnostic: list[str], entry: list[str]) -> int:
+    """Longest shared contiguous phrase with three distinct meaningful terms.
+
+    Keep short words, stopwords, failure boilerplate and paths in the sequence:
+    dropping them would join words that were never adjacent. They do not satisfy
+    the meaningful floor.
+    Each cell counts the matching suffix ending at this pair of terms.
+    """
+    previous = [0] * (len(entry) + 1)
+    best = 0
+    for i, term in enumerate(diagnostic):
+        current = [0] * (len(entry) + 1)
+        for j, entry_term in enumerate(entry):
+            if term != entry_term:
+                continue
+            size = current[j + 1] = previous[j] + 1
+            if size > best:
+                meaningful = {
+                    word
+                    for word in diagnostic[i + 1 - size : i + 1]
+                    if len(word) >= 4
+                    and not word.isdigit()
+                    and word not in _STOPWORDS
+                    and word not in _DIAGNOSTIC_BOILERPLATE
+                    and "/" not in word
+                    and "\\" not in word
+                }
+                if len(meaningful) >= 3:
+                    best = size
+        previous = current
+    return best
 
 
 def _safe_read_corpus_file(path: Path) -> str | None:
@@ -357,28 +444,31 @@ def _corpus_entry_lines(corpus_root: Path) -> list[str]:
     return lines
 
 
-def _find_recorded_entry(corpus_root: Path, tokens: set[str]) -> tuple[str, str] | None:
-    """The best-scoring corpus entry for `tokens` (score = distinct tokens
-    present in the lowercased entry text), or None below score 3. Returns
-    (entry text without its trailing tag, cut to 300 chars; entry id)."""
-    if not tokens:
+def _find_recorded_entry(corpus_root: Path, diagnostic: list[str]) -> tuple[str, str] | None:
+    """Entry with the longest matching diagnostic phrase, excluding tags.
+
+    Different entry ids tied for the longest span are ambiguous: return None.
+    Otherwise return (entry text without its trailing tag, cut to 300 chars;
+    entry id).
+    """
+    if not diagnostic:
         return None
     best_score = 0
-    best_line: str | None = None
+    best_hits: dict[str, str] = {}
     for line in _corpus_entry_lines(corpus_root):
-        lowered = line.lower()
-        score = sum(1 for token in tokens if token in lowered)
+        tag = _ENTRY_ID_TAG_RE.search(line)
+        if not tag:
+            continue
+        body = _TAG_RE.sub("", line[2:]).rstrip()
+        score = _longest_diagnostic_span(diagnostic, _normalized_terms(body))
         if score > best_score:
             best_score = score
-            best_line = line
-    if best_score < 3 or best_line is None:
+            best_hits.clear()
+        if score and score == best_score:
+            best_hits.setdefault(tag.group(1), body[:300])
+    if len(best_hits) != 1:
         return None
-    m = _ENTRY_ID_TAG_RE.search(best_line)
-    if not m:
-        return None
-    entry_id = m.group(1)
-    body = best_line[2:] if best_line.startswith("- ") else best_line
-    entry_text = _TAG_RE.sub("", body).rstrip()[:300]
+    entry_id, entry_text = next(iter(best_hits.items()))
     return entry_text, entry_id
 
 
@@ -501,8 +591,8 @@ def main() -> None:
     # External mode: scan the resolved corpus root. Legacy (no catalog
     # entry, a plain LEARNINGS.md in cwd): scan cwd itself.
     corpus_root = Path(location.corpus_root) if location is not None and location.mode == "external" else Path(cwd)
-    tokens = _signature_tokens(command, error)
-    hit = _find_recorded_entry(corpus_root, tokens)
+    diagnostic = _diagnostic_terms(error)
+    hit = _find_recorded_entry(corpus_root, diagnostic)
     if hit is not None:
         entry_text, entry_id = hit
         message = f"Recorded before: {entry_text} [{entry_id}]. {RECORDED_BEFORE_SUFFIX}"

@@ -6,21 +6,21 @@
 
 For each LEARNINGS-{topic}.md, reads the H1 + the `<!-- summary: ...
 keywords: ... -->` header block, builds a rich topic-list index, and
-overwrites LEARNINGS.md with it. Preserves the preamble (everything before
-the first `## ` section) of the existing LEARNINGS.md.
+replaces only the identified catalog in LEARNINGS.md. Other sections stay
+unchanged; ambiguous or stale catalog prose requires manual reconciliation.
 
 Topics are listed alphabetically by H1 text. (Future: optional ordering via a
 LEARNINGS.order file.)
 
 Usage:
-  bin/learnings-index.sh [--dry-run]
+  bin/learnings-index.sh [--cwd <project-root>] [--dry-run]
 
 Env:
   LEARNINGS_DIR  Directory containing LEARNINGS-*.md files. Defaults to cwd.
 
 Exit codes:
   0  success
-  1  no LEARNINGS-*.md files, or filesystem error
+  1  unrecognized index, no topic files, or filesystem error
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ def _load_state_module():
     finally:
         sys.dont_write_bytecode = previous
     return module
+
 
 HEADER_BLOCK_PATTERN = re.compile(r"<!--(.*?)-->", re.DOTALL)
 SLUG_RE = re.compile(r"^LEARNINGS-(.+)\.md$")
@@ -136,24 +137,6 @@ def _slug_to_title(slug: str) -> str:
     return slug.replace("-", " ").strip().capitalize() or slug
 
 
-def extract_preamble(main_file: Path, content: str | None = None) -> list[str]:
-    if content is None:
-        if not main_file.exists():
-            return ["# Learnings"]
-        content = main_file.read_text(encoding="utf-8")
-    if not content:
-        return ["# Learnings"]
-    lines = content.splitlines()
-    preamble: list[str] = []
-    for line in lines:
-        if line.startswith("## "):
-            break
-        preamble.append(line)
-    while preamble and preamble[-1].strip() == "":
-        preamble = preamble[:-1]
-    return preamble
-
-
 def build_index(
     preamble: list[str],
     groups: list[dict[str, object]],
@@ -210,6 +193,189 @@ def build_index(
     return "\n".join(out) + "\n"
 
 
+_CATALOG_HEADING = re.compile(r"^###\s+.+?\s+→\s+(LEARNINGS-[^\s]+\.md)(?:\s+\(\d+ lines\))?\s*$")
+_CATALOG_LINK = re.compile(r"^[-*]\s+\[[^\]]*\]\((LEARNINGS-[^)]+\.md)\)(?:\s+\(\d+ lines\))?\s*$")
+_CATALOG_CHILD = re.compile(r"^[-*]\s+[^\n]+?\s+→\s+(LEARNINGS-[^\s]+--[^\s]+\.md)(?:\s+\(\d+ lines\))?(?:: (.*))?\s*$")
+_THIN_INDEX_FINGERPRINT = (
+    "Index of topic-specific learnings. Each subfile should stay under "
+    "200 lines; split further with LEARNINGS-{topic}-{subtopic}.md "
+    "if needed."
+)
+
+
+class CatalogShapeError(ValueError):
+    """The catalog cannot be replaced without discarding uncertain prose."""
+
+
+def _catalog_body_is_supported(corpus_root: Path, body: str, contents: dict[str, str]) -> bool:
+    """Admit emitted rows and current metadata, never arbitrary lesson prose."""
+    lines = body.splitlines()
+    index = 0
+    heading = False
+    metadata: list[list[str]] = []
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
+            index += 1
+            continue
+        rich = _CATALOG_HEADING.fullmatch(line)
+        if rich:
+            name = rich.group(1)
+            if name not in contents:
+                raise ValueError(f"catalog references missing corpus member {name}")
+            record = parse_subfile(corpus_root / name, contents[name])
+            summary = str(record["summary"]) or (
+                f"*(no summary — add a `<!-- summary: ... -->` header to `{name}` by hand)*"
+            )
+            metadata = [summary.splitlines()]
+            if not record["summary"]:
+                metadata.append([f"*(no summary — run `bin/learnings-summarize.sh {name}`)*"])
+            if record["keywords"]:
+                metadata.append(f"Keywords: {record['keywords']}".splitlines())
+            heading = True
+            index += 1
+            continue
+        if line.startswith("### ") and "→" not in line:
+            # A parent without its own file has only a child list.
+            following = next((item for item in lines[index + 1 :] if item.strip()), None)
+            if following != "Subtopics:":
+                return False
+            heading, metadata = True, []
+            index += 1
+            continue
+        if link := _CATALOG_LINK.fullmatch(line):
+            if link.group(1) not in contents:
+                raise ValueError(f"catalog references missing corpus member {link.group(1)}")
+            heading, metadata = False, []
+            index += 1
+            continue
+        if line == "Subtopics:" and heading:
+            index += 1
+            start = index
+            while index < len(lines) and (child := _CATALOG_CHILD.fullmatch(lines[index])):
+                name, _snippet = child.groups()
+                if name not in contents:
+                    raise ValueError(f"catalog references missing corpus member {name}")
+                # The suffix is an explicit catalog field, so old metadata is
+                # safe to refresh. Free-standing prose below a row is not.
+                index += 1
+            if index == start:
+                return False
+            heading, metadata = False, []
+            continue
+        block = next((part for part in metadata if lines[index : index + len(part)] == part), None)
+        if block is None:
+            return False
+        index += len(block)
+        metadata.remove(block)
+    return True
+
+
+def _catalog_surroundings(corpus_root: Path, contents: dict[str, str]) -> tuple[str, str]:
+    """Find the replaceable catalog, retaining every byte outside its span."""
+    main = contents["LEARNINGS.md"]
+    # Check all structural rows before classifying any unknown prose. A stale
+    # shape may keep capture available; a missing member must remain an error.
+    for line in main.splitlines():
+        row = _CATALOG_HEADING.fullmatch(line) or _CATALOG_LINK.fullmatch(line) or _CATALOG_CHILD.fullmatch(line)
+        if row and row.group(1) not in contents:
+            raise ValueError(f"catalog references missing corpus member {row.group(1)}")
+    sections = list(re.finditer(r"(?m)^##[ \t]+([^\r\n]+)\r?$", main))
+    topics = [section for section in sections if section.group(1).strip() == "Topics"]
+    if len(topics) == 1:
+        section = topics[0]
+        end = next((item.start() for item in sections if item.start() > section.start()), len(main))
+        prefix, body, suffix = main[: section.start()], main[section.end() : end], main[end:]
+    elif not sections:
+        # Older rich and standalone-link indexes have no Topics H2 yet.
+        rows = list(re.finditer(r"(?m)^.*(?:\n|$)", main))
+        start = next(
+            (
+                row.start()
+                for row in rows
+                if row.group().startswith("### ") or _CATALOG_LINK.fullmatch(row.group().rstrip("\r\n"))
+            ),
+            None,
+        )
+        if start is None:
+            # A thin preamble contains no catalog to discard; retain it all.
+            if _THIN_INDEX_FINGERPRINT in main:
+                return main, ""
+            raise CatalogShapeError("catalog boundary is ambiguous; refusing to replace LEARNINGS.md")
+        prefix, body, suffix = main[:start], main[start:], ""
+    else:
+        raise CatalogShapeError("catalog boundary is ambiguous; refusing to replace LEARNINGS.md")
+    if not _catalog_body_is_supported(corpus_root, body, contents):
+        raise CatalogShapeError(
+            "unsupported or stale catalog text needs reconciliation; refusing to replace LEARNINGS.md"
+        )
+    return prefix, suffix
+
+
+def render_index(corpus_root: Path, contents: dict[str, str]) -> tuple[str, int, int]:
+    """Render checked corpus text without reading or writing any files."""
+    by_parent: dict[str, dict[str, object]] = {}
+    for name, content in contents.items():
+        if not name.startswith("LEARNINGS-"):
+            continue
+        parent_slug, child_slug = parse_topic_slug(name)
+        group = by_parent.setdefault(parent_slug, {"record": None, "children": []})
+        record = parse_subfile(corpus_root / name, content)
+        if child_slug is None:
+            group["record"] = record
+        else:
+            record["child_slug"] = child_slug
+            record["topic_key"] = f"{parent_slug}--{child_slug}"
+            group["children"].append(record)
+    groups: list[dict[str, object]] = []
+    for parent_slug, group in by_parent.items():
+        record = group["record"]
+        display = str(record["topic"]) if record is not None else _slug_to_title(parent_slug)
+        group["children"].sort(key=lambda child: str(child["child_slug"]).lower())
+        groups.append({"display": display, "record": record, "children": group["children"]})
+    groups.sort(key=lambda group: str(group["display"]).lower())
+    prefix, suffix = _catalog_surroundings(corpus_root, contents)
+    catalog = build_index([], groups).lstrip("\n")
+    separator = "" if not prefix or prefix.endswith("\n\n") else "\n" if prefix.endswith("\n") else "\n\n"
+    rendered = prefix + separator + catalog + ("\n" if suffix else "") + suffix
+    return rendered, len(groups), sum(len(group["children"]) for group in groups)
+
+
+def _select_index_paths(state, location) -> tuple[Path, ...]:
+    """Select every corpus name; fd readers must reject unsafe matching files."""
+    if location.mode == "external":
+        return state.select_external_corpus_files(location)
+    return tuple(
+        sorted(
+            (path for path in location.corpus_root.iterdir() if state.is_valid_corpus_filename(path.name)),
+            key=lambda path: path.name,
+        )
+    )
+
+
+def _read_preview(state, location) -> dict[str, str]:
+    """Preview through fd-bound readers without locks or journal recovery."""
+    paths = _select_index_paths(state, location)
+    if location.mode == "external":
+        return {path.name: state.read_external_corpus_snapshot(location, path).text for path in paths}
+    return {path.name: state._read_legacy_corpus_snapshot(location, path).text for path in paths}
+
+
+def _checked_index(state, location, contents: dict[str, str]) -> tuple[str, int, int]:
+    if "LEARNINGS.md" not in contents:
+        raise state.CorpusMutationError("LEARNINGS.md is missing")
+    if not state._selected_corpus_is_index(contents["LEARNINGS.md"], set(contents)):
+        raise state.CorpusMutationError("LEARNINGS.md is not a recognized index; refusing to replace monolith content")
+    if not any(name.startswith("LEARNINGS-") for name in contents):
+        raise state.CorpusMutationError("no LEARNINGS-*.md files to index")
+    try:
+        return render_index(location.corpus_root, contents)
+    except CatalogShapeError:
+        raise
+    except ValueError as exc:
+        raise state.CorpusMutationError(f"{exc}; refusing to replace LEARNINGS.md") from exc
+
+
 def _parse_args(argv: list[str]) -> tuple[Path | None, bool] | None:
     requested_project_root: Path | None = None
     dry_run = False
@@ -250,68 +416,29 @@ def main() -> int:
             project_root,
             requested_root=Path(explicit) if explicit else None,
         )
+        if dry_run:
+            new_index, _topics, _children = _checked_index(state, location, _read_preview(state, location))
+            print("WOULD write to LEARNINGS.md:")
+            print()
+            print(new_index)
+            return 0
         with state.corpus_write_session(location, timeout_seconds=CORPUS_LOCK_TIMEOUT_SECONDS) as session:
-            selected = session.select_files()
+            selected = _select_index_paths(state, location)
             snapshots = {path: session.read(path) for path in selected}
-            subfiles = [path for path in selected if path.name.startswith("LEARNINGS-")]
             main_file = location.corpus_root / "LEARNINGS.md"
-            if not subfiles:
-                sys.stderr.write(
-                    f"error: no LEARNINGS-*.md files in {location.corpus_root}\n"
-                )
-                return 1
-
-            # Group nested sub-subfiles (LEARNINGS-{parent}--{child}.md) under their
-            # parent topic; flat topics (no `--`) are their own group, no children.
-            by_parent: dict[str, dict[str, object]] = {}
-            for p in subfiles:
-                content = snapshots[p].text
-                parent_slug, child_slug = parse_topic_slug(p.name)
-                grp = by_parent.setdefault(parent_slug, {"record": None, "children": []})
-                rec = parse_subfile(p, content)
-                if child_slug is None:
-                    grp["record"] = rec
-                else:
-                    rec["child_slug"] = child_slug
-                    rec["topic_key"] = f"{parent_slug}--{child_slug}"
-                    grp["children"].append(rec)
-
-            groups: list[dict[str, object]] = []
-            for parent_slug, grp in by_parent.items():
-                rec = grp["record"]
-                display = str(rec["topic"]) if rec is not None else _slug_to_title(parent_slug)
-                grp["children"].sort(key=lambda c: str(c["child_slug"]).lower())
-                groups.append({"display": display, "record": rec, "children": grp["children"]})
-            groups.sort(key=lambda g: str(g["display"]).lower())
-
-            main_snapshot = snapshots.get(main_file)
-            existing_text = main_snapshot.text if main_snapshot else None
-            preamble = extract_preamble(main_file, existing_text)
-            new_index = build_index(preamble, groups)
-
-            if dry_run:
-                print("WOULD write to LEARNINGS.md:")
-                print()
-                print(new_index)
-            else:
-                if main_snapshot is None:
-                    if location.mode == "external":
-                        raise state.CorpusMutationError("LEARNINGS.md is missing")
-                    session.commit(state.CorpusMutationBatch(creations=(("LEARNINGS.md", new_index),)))
-                else:
-                    session.commit(state.CorpusMutationBatch(replacements=((main_snapshot, new_index),)))
-                n_children = sum(len(g["children"]) for g in groups)
-                suffix = f" + {n_children} subtopics" if n_children else ""
-                print(
-                    f"wrote {main_file.name} ({len(groups)} topics{suffix}, "
-                    f"{new_index.count(chr(10))} lines)"
-                )
+            contents = {path.name: snapshot.text for path, snapshot in snapshots.items()}
+            new_index, n_topics, n_children = _checked_index(state, location, contents)
+            main_snapshot = snapshots[main_file]
+            session.commit(state.CorpusMutationBatch(replacements=((main_snapshot, new_index),)))
+            suffix = f" + {n_children} subtopics" if n_children else ""
+            print(f"wrote {main_file.name} ({n_topics} topics{suffix}, {new_index.count(chr(10))} lines)")
         return 0
     except (
         state.ProjectRootError,
         state.IdentityResolutionError,
         state.CorpusResolutionError,
         state.CorpusMutationError,
+        CatalogShapeError,
         OSError,
         UnicodeError,
     ) as exc:
