@@ -37,7 +37,8 @@ notes in the same area.
 ## Add a learning
 
 First contact with a resolved mistake gets one archive line through `learn add`; second contact is a `learn search` hit that saved you or the user saying "this keeps happening".
-On second contact, read `~/.agents/skills/route-learning/SKILL.md` and route the existing lesson rather than adding another archive entry.
+On second contact, load the bundled [route-learning](../route-learning/SKILL.md)
+skill and route the existing lesson rather than adding another archive entry.
 
 When the user asks to remember something, or the work reveals a durable project
 lesson, add one focused entry through the shared writer:

@@ -1,6 +1,6 @@
 [project]
 name = "learnings-md-system-codex"
-version = "0.2.10"
+version = "0.2.11"
 description = "Codex-native lifecycle adapter for the shared LEARNINGS system"
 requires-python = ">=3.11"
 dependencies = []

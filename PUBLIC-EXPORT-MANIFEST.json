@@ -14,7 +14,7 @@
     },
     "CLAUDE.md": {
       "mode": "0644",
-      "sha256": "944359012a4e1cab7a732776d9b70d90004935725797d7452e0c9bd0c1ba7c70"
+      "sha256": "c6ad719eee41227e8f18f6a16a85d610221b3e38830818332216941408ea6723"
     },
     "CONTEXT.md": {
       "mode": "0644",
@@ -26,7 +26,7 @@
     },
     "DESIGN-STORY.md": {
       "mode": "0644",
-      "sha256": "e227c6346ba8184cca31b7468e89d93f713ce49eaf61446fa3f8999cc1a181a4"
+      "sha256": "6700de8aa63ae809b600994fd079b26fbf278c42e36f7b07d9958c0980f8a961"
     },
     "LICENSE": {
       "mode": "0644",
@@ -34,7 +34,7 @@
     },
     "README.md": {
       "mode": "0644",
-      "sha256": "a6f116db99aae5039fa29d6fb0ac4c6f773349806ad1760dbccb3c08205eaf41"
+      "sha256": "cb4385785a585c87d284f406f0ce6d30f3f0e7c316fb189085dd3d781c75434f"
     },
     "bin/deploy.sh": {
       "mode": "0755",
@@ -42,15 +42,15 @@
     },
     "bin/learn": {
       "mode": "0755",
-      "sha256": "dee056c958c4092887710b00e70d35bc365d47e74eb533764e847227252bba62"
+      "sha256": "bca0925c18c0067aa5cb8171fa553059f20c218844f6dc33c0c2c440a5330835"
     },
     "bin/learnings-index.sh": {
       "mode": "0755",
-      "sha256": "5484c528d02140871a22efe035680aa6c618e58371e0a7fd07d39924680e3946"
+      "sha256": "a163726c7da214ae3cb4e4a88f56744964d86084c4c52611488283ae40b96555"
     },
     "bin/learnings-register.sh": {
       "mode": "0755",
-      "sha256": "d420f512d78d4b87a9c513efce2fdb50b92f36b4a3c3bcaa34f1dcdfb369ac60"
+      "sha256": "0c78ced36d31265461a8072825186ea33e934319b8bb6fef188a4d7f923bd0ea"
     },
     "bin/learnings-retire.sh": {
       "mode": "0755",
@@ -58,11 +58,11 @@
     },
     "bin/learnings-state.sh": {
       "mode": "0644",
-      "sha256": "0871724230e8f1bae138478d245f3bc69737d21c1c4e4dc3316edaea1eb3f7dc"
+      "sha256": "ea2ae5c002f1623b9da5551707d4fb2989ba56fe4708bb9244db88b3b568f043"
     },
     "bin/learnings-write.sh": {
       "mode": "0755",
-      "sha256": "7c4c73f999b608901bd1fe030f0fb33a380386e247db1512bfe4676ea93e9dd2"
+      "sha256": "e4f369c98b68ba0707e3f4b0d2e86f30c6cd094b83477f4d53edee14ef694178"
     },
     "bin/preflight-gate-classes.json": {
       "mode": "0644",
@@ -78,15 +78,15 @@
     },
     "hooks/learning-on-failure.py": {
       "mode": "0755",
-      "sha256": "0a8a50ec2900a864f3b547f243686bae0bf6e0c0ae430b8171cbc3bb2fad956e"
+      "sha256": "0879720d724849424384b812424cb1498bd1125200a237112beefb13acbd7c12"
     },
     "hooks/learning-on-start.py": {
       "mode": "0644",
-      "sha256": "2948f9ee6cd454bf9972905f35c079544dbda616335ef6445b20416fd97d93a6"
+      "sha256": "a38118b504bc141f38d37c3337569cee266b758e56a113e5b18ff4cec509c148"
     },
     "hooks/preflight-gate.py": {
       "mode": "0644",
-      "sha256": "550b92b6117bfac27e1edcb64c4d592fa4fb529758025feaecb369fa09369fcc"
+      "sha256": "1b40a3f13898244e8fef29af3a84d4a494485399cbe4a4c68f8c523d421ec29e"
     },
     "hooks/scaffold-learnings.sh": {
       "mode": "0755",
@@ -94,7 +94,7 @@
     },
     "plugins/learnings-md-system-codex/.codex-plugin/plugin.json": {
       "mode": "0644",
-      "sha256": "c27d672a2a681c7434acc1edece5d7e6f15a1cb6507cb838790d3b4b6df02cee"
+      "sha256": "f042193d2af3c9321f07aa4b572b0bb94a0d5e879cf52892eb90940059beb5a2"
     },
     "plugins/learnings-md-system-codex/.gitignore": {
       "mode": "0644",
@@ -102,7 +102,7 @@
     },
     "plugins/learnings-md-system-codex/README.md": {
       "mode": "0644",
-      "sha256": "9e1f9cbca23a42aa757995a6ccc98bc673dd97c7fc8c8ee73b70bd35a6eaa4ce"
+      "sha256": "5689f281ae854c3c619eed7f1f74ff958ab78b82f027cd0a23c4bdc319007165"
     },
     "plugins/learnings-md-system-codex/hooks/hooks.json": {
       "mode": "0644",
@@ -110,15 +110,19 @@
     },
     "plugins/learnings-md-system-codex/pyproject.toml": {
       "mode": "0644",
-      "sha256": "2c9e4188cdee0e1a06485b0ca00dbc6c51040894d05ccdd0a73fbd8e254182fc"
+      "sha256": "65d03930b9a92384cc67f97694acf520477ef8995c9b9d3e44be48643a0df2d1"
     },
     "plugins/learnings-md-system-codex/scripts/codex-learnings-hook.py": {
       "mode": "0755",
-      "sha256": "45f135574f48074e9ae56d099afcbbd19ded7d6abfbd28bf06b4a2c4f1a29c88"
+      "sha256": "b314d0727a60fd48a65adc46e0ae7ceefbf7a0f424637ac5e715ddf1d1b08287"
+    },
+    "plugins/learnings-md-system-codex/skills/route-learning/SKILL.md": {
+      "mode": "0644",
+      "sha256": "40251d2972432394aae9b27747fba2b749a281a0d7657dee7a3d009868c7b84d"
     },
     "plugins/learnings-md-system-codex/skills/search-learnings/SKILL.md": {
       "mode": "0644",
-      "sha256": "2d505ee9203c8a056fcb1ab5672314ca81ee513111def6cf5f50c4579a064527"
+      "sha256": "97440a3add609f516961996c5b56a57a942aa45c985a445817d4508ede491513"
     },
     "plugins/learnings-md-system-codex/skills/search-learnings/agents/openai.yaml": {
       "mode": "0644",
@@ -126,7 +130,7 @@
     },
     "plugins/learnings-md-system-codex/uv.lock": {
       "mode": "0644",
-      "sha256": "c2fdfca372fc77bd246c4973e8b15665ebbf487210c27e43ddeb1dfe87a135b7"
+      "sha256": "415f7c65a57a1f5f67e6b4199096ca06023c9682f97800302616561814380f93"
     },
     "release/VERSION": {
       "mode": "0644",
@@ -138,11 +142,11 @@
     },
     "skills/route-learning/SKILL.md": {
       "mode": "0644",
-      "sha256": "758d4bec38307bf472ae912f6434c72d7eacd3f7560a7041606299bfb06a7428"
+      "sha256": "97a14bd9d6a350d3fb373d31e79a0427f0191714cf4bda187197786a69b671b5"
     },
     "skills/search-learnings/SKILL.md": {
       "mode": "0644",
-      "sha256": "70f3d7f10490147a49dd18641ee3c0e3f84df3417ba05dfd23230c49a581da0a"
+      "sha256": "ab5d2d5666dea548738a7cc9686cc7f2a2b852777993c02669b6ae24bfe1c9f2"
     },
     "templates/LEARNINGS.md": {
       "mode": "0644",
@@ -150,5 +154,5 @@
     }
   },
   "schema_version": 1,
-  "source_commit": "a1e88e6e80c4238fbec43a45d86eafc6db04d5bb"
+  "source_commit": "2fc77dc757ff95ddbbeb1bb2136ad647a09e3fe0"
 }

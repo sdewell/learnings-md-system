@@ -40,13 +40,15 @@ from pathlib import Path
 # mentioning it) is acceptable — the gate is advisory.
 GH_PR_CREATE_RE = re.compile(r"(?:^|[\s;&|(])(?:\S*/)?gh\s+pr\s+create\b")
 
-_ADAPTER_BIN = Path(__file__).resolve().parent.parent / "bin"
-if (_ADAPTER_BIN / "deploy.sh").is_file():
-    _ADAPTER_BIN = Path.home() / ".claude" / "bin"
+# The copy beside this hook (checkout or installed core) is canonical; the
+# installed core is the fallback for a hook copied anywhere else.
+_LOCAL_CLASSES = Path(__file__).resolve().parent.parent / "bin" / "preflight-gate-classes.json"
 CLASSES_PATH = (
-    _ADAPTER_BIN / "preflight-gate-classes.json"
-    if (_ADAPTER_BIN / "preflight-gate-classes.json").is_file()
-    else _ADAPTER_BIN / "learnings" / "preflight-gate-classes.json"
+    _LOCAL_CLASSES
+    if _LOCAL_CLASSES.is_file()
+    else Path(os.environ.get("LEARNINGS_CORE_HOME") or Path.home() / ".local" / "share" / "learnings-md-system")
+    / "bin"
+    / "preflight-gate-classes.json"
 )
 BYTE_CAP = 65536  # ~30x the real file; anything bigger is not ours
 

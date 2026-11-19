@@ -6,14 +6,7 @@
 # (ownership marker — required by bin/deploy.sh's no-clobber check)
 """learnings CLI — user-facing surface for the learnings-system.
 
-Subcommands:
-  status   show file sizes, section counts, ref-counts
-  search   keyword search across project + global learnings (Phase 1.next)
-  add      append an entry to a topic file (wraps learnings-write.sh)
-  deploy      wraps bin/deploy.sh
-  corpus      per-file corpus baseline + drift (Part 7A)
-
-Run with --help for argument details.
+Run with --help for the current subcommands and argument details.
 
 Design context: see the source repository's documentation.
 """
@@ -81,27 +74,17 @@ def _installed_bin_dir() -> Path:
     """Return the trusted helper directory for this CLI installation.
 
     Flat installed copies keep `learn` beside their helpers. Source checkouts
-    preserve the historical installed-tree fallback, and the legacy Claude
-    tree keeps helpers below its CLI. With valid activation the neutral-core
-    bin outranks the rollback tree (finding 5: a stale pre-slice rollback
-    tree must not shadow the neutral helpers); legacy-mode preference is
-    unchanged.
+    prefer usable core helpers regardless of state activation; the legacy
+    Claude tree remains a fallback and keeps helpers below its CLI.
     """
     here = Path(__file__).resolve().parent
     home = Path(os.environ.get("HOME") or Path.home())
     if (here / "deploy.sh").is_file():
-        configured_core = os.environ.get("LEARNINGS_CORE_HOME")
-        if configured_core and (Path(configured_core) / "bin").is_dir():
-            return Path(configured_core) / "bin"
         core = Path(
             os.environ.get("LEARNINGS_CORE_HOME") or home / ".local" / "share" / "learnings-md-system"
         )
         legacy = home / ".claude" / "bin" / "learnings"
-        if _state_seam_active() and (core / "bin").is_dir():
-            return core / "bin"
-        if legacy.is_dir():
-            return legacy
-        if (core / "bin").is_dir():
+        if (core / "bin" / "learnings-write.sh").is_file():
             return core / "bin"
         return legacy
     if (here / "learnings-write.sh").is_file():
@@ -1272,20 +1255,68 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     return proc.returncode
 
 
+def _index_helper_is_current(script: Path) -> bool:
+    """An older selected helper must not bypass the monolith refusal."""
+    loader = importlib.machinery.SourceFileLoader("_learn_index_helper", str(script))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        return False
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    try:
+        sys.dont_write_bytecode = True
+        loader.exec_module(module)
+    except Exception:
+        return False
+    finally:
+        sys.dont_write_bytecode = previous
+    return all(callable(getattr(module, name, None)) for name in ("render_index", "_checked_index", "main"))
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    if args.apply and not args.yes:
+        sys.stderr.write("learn index: --apply requires --yes\n")
+        return 2
+    observed_cwd = Path(args.cwd or ".").resolve()
+    script = _resolve_helper(observed_cwd, "learnings-index.sh")
+    if script is None:
+        sys.stderr.write("error: learnings-index.sh not found; run bin/deploy.sh\n")
+        return 1
+    if not _index_helper_is_current(script):
+        sys.stderr.write(f"error: incompatible index helper {script}; update the selected helper and retry\n")
+        return 1
+    cwd = observed_cwd
+    if args.cwd is None:
+        writer, error = _load_write_module(observed_cwd)
+        if writer is None:
+            sys.stderr.write(f"error: {error}\n")
+            return 1
+        cwd = writer._resolve_learnings_dir(observed_cwd)
+    command = [str(script), "--cwd", str(cwd)]
+    if not args.apply:
+        command.append("--dry-run")
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     observed_cwd = Path(args.cwd or ".").resolve()
     write_script = _resolve_helper(observed_cwd, "learnings-write.sh")
     if write_script is None:
-        sys.stderr.write(
-            "error: learnings-write.sh not found "
-            f"(checked {observed_cwd / 'bin'} and {GLOBAL_BIN_DIR})\n"
-        )
+        sys.stderr.write(f"error: learnings-write.sh not found (checked {observed_cwd / 'bin'} and {GLOBAL_BIN_DIR})\n")
+        return 1
+    write_module, error = _load_write_module(observed_cwd)
+    if write_module is None:
+        sys.stderr.write(f"error: {error}\n")
+        return 1
+    if not callable(getattr(write_module, "_load_index_module", None)):
+        sys.stderr.write(f"error: incompatible writer helper {write_script}; update the selected helper and retry\n")
         return 1
     if args.cwd is None:
-        write_module, error = _load_write_module(observed_cwd)
-        if write_module is None:
-            sys.stderr.write(f"error: {error}\n")
-            return 1
         cwd = write_module._resolve_learnings_dir(observed_cwd)
     else:
         cwd = observed_cwd
@@ -3016,6 +3047,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_add.set_defaults(func=cmd_add)
 
+    p_index = sub.add_parser(
+        "index", allow_abbrev=False, help="preview the existing topic index; --apply --yes refreshes it"
+    )
+    p_index.add_argument("--cwd", default=None, help="project directory (default: current project)")
+    index_mode = p_index.add_mutually_exclusive_group()
+    index_mode.add_argument("--dry-run", action="store_true", help="preview only (the default)")
+    index_mode.add_argument("--apply", action="store_true", help="refresh the index; requires --yes")
+    p_index.add_argument("--yes", action="store_true", help="confirm --apply")
+    p_index.set_defaults(func=cmd_index)
+
     p_deploy = sub.add_parser(
         "deploy",
         help="run bin/deploy.sh (only available from canonical-source repo)",
@@ -3308,6 +3349,8 @@ def _mutating_invocation(args: argparse.Namespace) -> str | None:
     which hide under a shared top-level verb. `bin/learn`'s own
     `mutating_commands` set below decides activity-lock wrapping only."""
     action = getattr(args, "action", None)
+    if args.command == "index":
+        return "index" if args.apply else None
     if args.command in STATE.LEARN_MUTATING_SUBCOMMANDS:
         return args.command
     if args.command == "corpus" and (action in STATE.LEARN_CORPUS_MUTATING_ACTIONS or action == "baseline"):

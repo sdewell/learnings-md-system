@@ -5,8 +5,9 @@ and runs the shared preflight advisory before relevant Bash calls.
 
 The shared core is installed under `~/.local/share/learnings-md-system/`.
 The plugin owns Codex hook schemas, packaging, and the `search-learnings`
-skill. Corpus policy remains in the shared core. Nothing in the shared core
-calls a model; the only corpus writer is `learn add`.
+and `route-learning` skills. Corpus policy remains in the shared core. Nothing
+in the shared core calls a model. Entries enter the archive through `learn add`;
+`learn index` refreshes catalog metadata.
 
 ## Flow
 
@@ -64,7 +65,7 @@ available to both Claude Code and Codex.
 ## Requirements
 
 - Codex CLI with stable lifecycle hooks (`0.144.6` was verified).
-- `uv` and Python 3.12 or newer, to run the dependency-free adapter and the
+- `uv` and Python 3.11 or newer, to run the dependency-free adapter and the
   shared Python hook.
 - The neutral installed core, created by the core's `bin/deploy.sh`:
   - `~/.local/share/learnings-md-system/hooks/`
@@ -141,6 +142,11 @@ The retrieval skill invokes the neutral core's `bin/learn`; it does not
 create a Codex-specific CLI copy. Its commands set a temporary
 `UV_CACHE_DIR` so the shared uv-shebang CLI also works inside Codex's
 workspace sandbox.
+
+When a search result helped with the current problem, load the bundled
+`route-learning` skill. It guides the choice between a preventive check,
+instructions, a procedure, or leaving the lesson in the archive. It does not
+require a separate global skill installation or an automatic failure nudge.
 
 ## Boundaries
 

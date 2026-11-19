@@ -3438,6 +3438,11 @@ def normalize_remote(remote: str) -> str | None:
     return f"{authority}{path}"
 
 
+# git 2.56 reworded a gitfile that points at a non-repo: 2.55 said "not a git
+# repository: (null)", 2.56 says "gitfile does not point to a valid repository".
+_GIT_NOT_A_REPO_TOKENS = ("not a git repository", "gitfile does not point to a valid repository")
+
+
 def _git(cwd: Path, *args: str) -> str | None:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -3452,7 +3457,7 @@ def _git(cwd: Path, *args: str) -> str | None:
         raise IdentityResolutionError("git identity probe failed") from None
     if result.returncode == 0:
         return result.stdout.strip() or None
-    if any(token in result.stderr.lower() for token in ("not a git repository", "must be run in a work tree")):
+    if any(token in result.stderr.lower() for token in (*_GIT_NOT_A_REPO_TOKENS, "must be run in a work tree")):
         return None
     raise IdentityResolutionError(f"git identity probe failed: {' '.join(args)}")
 
@@ -10422,6 +10427,7 @@ def abandon_external_corpora(plan: AbandonExternalPlan | None = None) -> tuple[s
 CENSUS_WORKER_SCRIPTS = frozenset(
     {
         "learnings-write.sh",
+        "learnings-index.sh",
         "learnings-retire.sh",
         "learnings-register.sh",
         # Deleted 2026-09-07 (worker trim, then the `learn sync` retirement
@@ -10457,6 +10463,7 @@ CENSUS_HOOK_RUNNERS = frozenset(
 LEARN_MUTATING_SUBCOMMANDS = frozenset(
     {
         "add",
+        "index",
         "migrate-ids",
         "cleanup",
     }
@@ -10560,9 +10567,35 @@ def _match_worker_fingerprint(command: str) -> str | None:
     index = 0
     while index < len(tokens):
         base = tokens[index].rsplit("/", 1)[-1]
+        if base == "learnings-index.sh":
+            cursor = index + 1
+            preview = False
+            while cursor < len(tokens) and not re.fullmatch(r"[;&|]+", tokens[cursor]):
+                if tokens[cursor] == "--cwd":
+                    cursor += 2
+                    continue
+                preview = preview or tokens[cursor] == "--dry-run"
+                cursor += 1
+            if not preview:
+                return base
+            index = cursor
+            continue
         if base in CENSUS_WORKER_SCRIPTS or base in CENSUS_HOOK_RUNNERS:
             return base
         if base == "learn":
+            if index + 1 < len(tokens) and tokens[index + 1] == "index":
+                cursor = index + 2
+                while cursor < len(tokens) and not re.fullmatch(r"[;&|]+", tokens[cursor]):
+                    if tokens[cursor] == "--cwd":
+                        cursor += 2
+                        continue
+                    if tokens[cursor] == "--apply":
+                        return "learn index"
+                    cursor += 1
+                if cursor < len(tokens):
+                    index = cursor
+                    continue
+                return None
             if index + 1 < len(tokens) and tokens[index + 1] == "corpus":
                 cursor = index + 2
                 while cursor < len(tokens) and not re.fullmatch(r"[;&|]+", tokens[cursor]):
@@ -10718,7 +10751,7 @@ def _worktree_roots(checkout: Path, strict: bool = False) -> list[Path]:
         except (OSError, subprocess.SubprocessError):
             raise IdentityResolutionError("git worktree probe failed") from None
         if probe.returncode != 0:
-            if "not a git repository" in probe.stderr.lower():
+            if any(token in probe.stderr.lower() for token in _GIT_NOT_A_REPO_TOKENS):
                 return [resolved]
             raise IdentityResolutionError("git worktree probe failed")
         if probe.stdout.strip() != "true":
